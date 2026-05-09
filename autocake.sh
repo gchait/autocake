@@ -11,7 +11,8 @@
 
 set -uo pipefail
 
-if [ "${EUID}" -ne 0 ]; then exec sudo -- "${0}" "${@}"; fi
+SCRIPT_PATH="$(readlink -f -- "${0}")"
+if [ "${EUID}" -ne 0 ]; then exec sudo -- "${SCRIPT_PATH}" "${@}"; fi
 
 for cmd in tc curl ip awk head flock modprobe; do
   command -v "${cmd}" > /dev/null 2>&1 || {
@@ -34,16 +35,19 @@ fi
 tc qdisc del dev lo root 2> /dev/null || true
 
 # Preflight: curl --next, used by the latency probe to reuse a single TLS
-# connection across samples. Added in curl 7.36 (March 2014).
-if ! curl --help all 2> /dev/null | grep -q -- '--next'; then
-  echo "ERROR: curl too old; need >= 7.36 for --next." >&2
+# connection across samples. Added in curl 7.36 (March 2014). We can't use
+# `curl --help all` to detect support: --help all is itself curl 7.73+, so
+# parsing the version string is the only reliable check.
+CURL_VER="$(curl --version | awk 'NR==1{print $2}')"
+if [ "$(printf '7.36.0\n%s\n' "${CURL_VER}" | sort -V | head -n1)" != "7.36.0" ]; then
+  echo "ERROR: curl ${CURL_VER} is too old; need >= 7.36 for --next." >&2
   exit 1
 fi
 
 # Acquire a process-wide lock so two instances can't fight over ifb0/tc.
-# Re-execs once under flock with SQM_LOCKED=1 so the inner run skips this.
-if [ -z "${SQM_LOCKED:-}" ]; then
-  exec env SQM_LOCKED=1 flock -n /tmp/autocake.lock "${0}" "${@}"
+# Re-execs once under flock with AUTOCAKE_LOCKED=1 so the inner run skips this.
+if [ -z "${AUTOCAKE_LOCKED:-}" ]; then
+  exec env AUTOCAKE_LOCKED=1 flock -n /tmp/autocake.lock "${SCRIPT_PATH}" "${@}"
 fi
 
 # --- autodetected from system state ---
@@ -181,36 +185,20 @@ pick_download_backend() {
 }
 
 # Background-fire one download stream against the round-robin backend
-# selected by stream index $3. Writes "speed http_code" to $1.
-download_curl_bg() {
-  local out="$1" bytes="$2" idx="$3"
+# selected by stream index $4. Pass an empty wfmt for pure-load streams
+# (the loaded probe doesn't read per-stream output); pass a speed/code
+# format string for measurement runs.
+download_bg() {
+  local out="$1" bytes="$2" timeout="$3" idx="$4" wfmt="$5"
   pick_download_backend "${idx}"
+  local args=(-s -o /dev/null --max-time "${timeout}")
+  [ -n "${wfmt}" ] && args+=(-w "${wfmt}")
   if [ "${_pick_max}" = "0" ]; then
-    curl -s -o /dev/null --max-time "${CURL_TIMEOUT}" \
-      -w '%{speed_download} %{http_code}\n' \
-      "${_pick_url//%BYTES%/${bytes}}" > "${out}" &
+    curl "${args[@]}" "${_pick_url//%BYTES%/${bytes}}" > "${out}" &
   else
     [ "${bytes}" -gt "${_pick_max}" ] && bytes="${_pick_max}"
-    curl -s -o /dev/null --max-time "${CURL_TIMEOUT}" \
-      -r "0-$((bytes - 1))" \
-      -w '%{speed_download} %{http_code}\n' \
-      "${_pick_url}" > "${out}" &
-  fi
-}
-
-# Background-fire one load-only download stream (no -w needed; pure load)
-# against the round-robin backend selected by stream index $2.
-download_load_bg() {
-  local bytes="$1" idx="$2"
-  pick_download_backend "${idx}"
-  if [ "${_pick_max}" = "0" ]; then
-    curl -s -o /dev/null --max-time "${LOAD_TIMEOUT}" \
-      "${_pick_url//%BYTES%/${bytes}}" > /dev/null &
-  else
-    [ "${bytes}" -gt "${_pick_max}" ] && bytes="${_pick_max}"
-    curl -s -o /dev/null --max-time "${LOAD_TIMEOUT}" \
-      -r "0-$((bytes - 1))" \
-      "${_pick_url}" > /dev/null &
+    args+=(-r "0-$((bytes - 1))")
+    curl "${args[@]}" "${_pick_url}" > "${out}" &
   fi
 }
 
@@ -317,7 +305,7 @@ measure_parallel() {
   local i
   for i in $(seq 1 "${streams}"); do
     if [ "${dir}" = down ]; then
-      download_curl_bg "${WORKDIR}/s${i}" "${bytes}" "$((i - 1))"
+      download_bg "${WORKDIR}/s${i}" "${bytes}" "${CURL_TIMEOUT}" "$((i - 1))" '%{speed_download} %{http_code}\n'
     else
       (head -c "${bytes}" /dev/zero |
         curl -s -o /dev/null --max-time "${CURL_TIMEOUT}" -X POST --data-binary @- \
@@ -381,7 +369,7 @@ loaded_latency_bidir() {
   local down_pids=() up_pids=()
   local i
   for i in $(seq 1 "${STREAMS}"); do
-    download_load_bg "${down_bytes}" "$((i - 1))"
+    download_bg /dev/null "${down_bytes}" "${LOAD_TIMEOUT}" "$((i - 1))" ''
     down_pids+=("$!")
     (head -c "${up_bytes}" /dev/zero |
       curl -s -o /dev/null --max-time "${LOAD_TIMEOUT}" -X POST --data-binary @- \

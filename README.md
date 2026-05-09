@@ -15,7 +15,7 @@ The hard part isn't the qdisc. It's picking the cap. Too high and the bottleneck
 ## Usage
 
 ```bash
-git clone https://github.com/<your-username>/autocake.git
+git clone https://github.com/gchait/autocake.git
 cd autocake
 sudo ./autocake.sh
 ```
