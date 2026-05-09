@@ -29,12 +29,24 @@ done
 
 # Acquire a host-wide lock so two instances can't fight over ifb0/tc. The
 # lock lives on FD 9 for the lifetime of the script — when this process
-# exits (any reason) the kernel closes the FD and the lock releases. Use
-# /run (root-owned, tmpfs) when available so a non-root user can't pre-
-# create the lock file and DoS us; fall back to /tmp on systems without
-# /run.
-LOCK_FILE="/run/autocake.lock"
-[ -d /run ] || LOCK_FILE="/tmp/autocake.lock"
+# exits (any reason) the kernel closes the FD and the lock releases.
+#
+# Putting the lock file inside a root-only 0700 directory is the only way
+# to keep a local non-root user from holding an exclusive flock on it: a
+# 0644 lock file is world-readable, and on Linux a read-only FD is enough
+# to hold LOCK_EX. /run is the right home for runtime state on any modern
+# Linux; we refuse to start without it rather than fall back to /tmp,
+# which is world-writable and offers no comparable guarantee.
+[ -d /run ] || {
+  echo "ERROR: /run not present — autocake needs a root-owned runtime directory" >&2
+  exit 1
+}
+LOCK_DIR="/run/autocake"
+if ! mkdir -p "${LOCK_DIR}" || ! chmod 0700 "${LOCK_DIR}"; then
+  echo "ERROR: cannot prepare lock directory ${LOCK_DIR}" >&2
+  exit 1
+fi
+LOCK_FILE="${LOCK_DIR}/lock"
 exec 9<> "${LOCK_FILE}" || {
   echo "ERROR: cannot open lock file ${LOCK_FILE}" >&2
   exit 1
@@ -406,10 +418,12 @@ load_bytes_per_stream() {
 # never fills and the probe falsely reports clean latency.
 #
 # Liveness check before sampling: on very fast caps, per-stream bytes can
-# finish before the probe completes. If at least one stream in either
-# direction has already exited, the queue isn't full and the measurement
-# would falsely report idle latency. Return "0 0" so the caller fails the
-# cap and tries a lower one instead.
+# finish before the probe completes; on backend-rate-limited caps, one
+# stream can 429 out while siblings keep going. Either case partially
+# drains the queue and would let the latency probe read something
+# between idle and loaded — a false pass. Require ALL streams alive in
+# both directions when the probe starts; if any has already exited,
+# return "0 0" so the caller fails the cap and tries a lower one.
 loaded_latency_bidir() {
   local down_cap="${1}" up_cap="${2}"
   local down_bytes up_bytes
@@ -434,7 +448,7 @@ loaded_latency_bidir() {
   for pid in "${up_pids[@]}"; do
     kill -0 "${pid}" 2> /dev/null && alive_up=$((alive_up + 1))
   done
-  if [ "${alive_down}" -eq 0 ] || [ "${alive_up}" -eq 0 ]; then
+  if [ "${alive_down}" -lt "${STREAMS}" ] || [ "${alive_up}" -lt "${STREAMS}" ]; then
     wait_all "${down_pids[@]}" "${up_pids[@]}"
     echo "0 0"
     return
@@ -640,6 +654,14 @@ echo "  pool: ${#WORKING_DOWNLOAD_BACKENDS[@]} of ${#DOWNLOAD_BACKENDS[@]} backe
 for _entry in "${WORKING_DOWNLOAD_BACKENDS[@]}"; do
   echo "    ${_entry%|*}"
 done
+# Surfacing this here, before the multi-minute search, lets the user abort
+# and retry from a network where more mirrors are reachable. The same
+# observation feeds CONF_NOTES at the end, but the end is too late if it
+# was going to influence a re-run decision.
+if [ "${#WORKING_DOWNLOAD_BACKENDS[@]}" -eq 1 ]; then
+  echo "  WARNING: only 1 backend in pool — ${STREAMS} streams will all hit one host;"
+  echo "    expect 429s under sustained load (Cloudflare's typical pattern)."
+fi
 echo "Measuring sustained throughput (${STREAMS} parallel streams per direction, distributed across pool)..."
 DL=$(measure_parallel down "${DOWN_BYTES}" "${STREAMS}")
 UL=$(measure_parallel up "${UP_BYTES}" "${STREAMS}")
@@ -840,7 +862,7 @@ fi
 # Refinement / fallback may have left a different cap active; re-apply best.
 sqm_apply "${BEST_UP}" "${BEST_DOWN}"
 SQM_COMMITTED=1
-echo "SQM ON at ${BEST_PCT}% — DOWN=${BEST_DOWN}Mbit UP=${BEST_UP}Mbit  [confidence: ${CONFIDENCE}]"
+echo "SQM ON at ${BEST_PCT}% — DOWN=${BEST_DOWN}Mbit UP=${BEST_UP}Mbit  [confidence: ${CONFIDENCE} (${CONF_SCORE})]"
 if [ "${#CONF_NOTES[@]}" -gt 0 ]; then
   for _note in "${CONF_NOTES[@]}"; do
     echo "  note: ${_note}"
