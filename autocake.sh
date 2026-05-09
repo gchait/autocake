@@ -421,9 +421,10 @@ load_bytes_per_stream() {
 # finish before the probe completes; on backend-rate-limited caps, one
 # stream can 429 out while siblings keep going. Either case partially
 # drains the queue and would let the latency probe read something
-# between idle and loaded — a false pass. Require ALL streams alive in
-# both directions when the probe starts; if any has already exited,
-# return "0 0" so the caller fails the cap and tries a lower one.
+# between idle and loaded — a false pass. Require alive ≥ STREAMS - 1
+# (i.e. tolerate at most one dropout) so a single transient backend
+# hiccup doesn't make every cap unmeasurable, while still rejecting the
+# 1-of-3 partial-drain case the original "any alive" check missed.
 loaded_latency_bidir() {
   local down_cap="${1}" up_cap="${2}"
   local down_bytes up_bytes
@@ -448,7 +449,9 @@ loaded_latency_bidir() {
   for pid in "${up_pids[@]}"; do
     kill -0 "${pid}" 2> /dev/null && alive_up=$((alive_up + 1))
   done
-  if [ "${alive_down}" -lt "${STREAMS}" ] || [ "${alive_up}" -lt "${STREAMS}" ]; then
+  local min_alive=$((STREAMS - 1))
+  [ "${min_alive}" -lt 1 ] && min_alive=1
+  if [ "${alive_down}" -lt "${min_alive}" ] || [ "${alive_up}" -lt "${min_alive}" ]; then
     wait_all "${down_pids[@]}" "${up_pids[@]}"
     echo "0 0"
     return
@@ -654,13 +657,19 @@ echo "  pool: ${#WORKING_DOWNLOAD_BACKENDS[@]} of ${#DOWNLOAD_BACKENDS[@]} backe
 for _entry in "${WORKING_DOWNLOAD_BACKENDS[@]}"; do
   echo "    ${_entry%|*}"
 done
-# Surfacing this here, before the multi-minute search, lets the user abort
-# and retry from a network where more mirrors are reachable. The same
-# observation feeds CONF_NOTES at the end, but the end is too late if it
-# was going to influence a re-run decision.
-if [ "${#WORKING_DOWNLOAD_BACKENDS[@]}" -eq 1 ]; then
-  echo "  WARNING: only 1 backend in pool — ${STREAMS} streams will all hit one host;"
-  echo "    expect 429s under sustained load (Cloudflare's typical pattern)."
+# Cap STREAMS at pool size so round-robin gives each backend at most one
+# stream. With STREAMS=3 and a 2-backend pool, the original code would
+# send streams 0+2 to backend 0 — Cloudflare's pattern is to 429 under
+# that sustained 2-stream load, which then cascades into every loaded
+# probe stalling. One-stream-per-backend keeps individual mirror load
+# below their rate-limit thresholds.
+if [ "${#WORKING_DOWNLOAD_BACKENDS[@]}" -lt "${STREAMS}" ]; then
+  echo "  STREAMS reduced from ${STREAMS} to ${#WORKING_DOWNLOAD_BACKENDS[@]} (one stream per backend; avoids double-loading any single mirror)"
+  STREAMS="${#WORKING_DOWNLOAD_BACKENDS[@]}"
+fi
+if [ "${STREAMS}" -eq 1 ]; then
+  echo "  WARNING: single-stream probe — on fast links the queue may not stay full,"
+  echo "    so the latency reading can falsely look idle. Re-run when more mirrors are reachable."
 fi
 echo "Measuring sustained throughput (${STREAMS} parallel streams per direction, distributed across pool)..."
 DL=$(measure_parallel down "${DOWN_BYTES}" "${STREAMS}")
