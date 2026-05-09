@@ -5,7 +5,7 @@
 # adaptive margin of idle, applies cake, and verifies the result. Zero flags,
 # zero env vars, zero per-rig tuning constants.
 #
-# Usage: sudo ./autocake.sh    (run from the repo directory)
+# Usage: sudo ./autocake.sh
 #
 # See README.md for the algorithm, requirements, and limitations.
 
