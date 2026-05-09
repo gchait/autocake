@@ -5,14 +5,20 @@
 # adaptive margin of idle, applies cake, and verifies the result. Zero flags,
 # zero env vars, zero per-rig tuning constants.
 #
-# Usage: sudo ./autocake.sh
+# Usage: ./autocake.sh   (auto-elevates with sudo if not already root)
 #
 # See README.md for the algorithm, requirements, and limitations.
 
 set -uo pipefail
 
 SCRIPT_PATH="$(readlink -f -- "${0}")"
-if [ "${EUID}" -ne 0 ]; then exec sudo -- "${SCRIPT_PATH}" "${@}"; fi
+if [ "${EUID}" -ne 0 ]; then
+  command -v sudo > /dev/null 2>&1 || {
+    echo "ERROR: must run as root, and sudo is not available" >&2
+    exit 1
+  }
+  exec sudo -- "${SCRIPT_PATH}" "${@}"
+fi
 
 for cmd in tc curl ip awk head flock modprobe; do
   command -v "${cmd}" > /dev/null 2>&1 || {
@@ -20,6 +26,23 @@ for cmd in tc curl ip awk head flock modprobe; do
     exit 1
   }
 done
+
+# Acquire a host-wide lock so two instances can't fight over ifb0/tc. The
+# lock lives on FD 9 for the lifetime of the script — when this process
+# exits (any reason) the kernel closes the FD and the lock releases. Use
+# /run (root-owned, tmpfs) when available so a non-root user can't pre-
+# create the lock file and DoS us; fall back to /tmp on systems without
+# /run.
+LOCK_FILE="/run/autocake.lock"
+[ -d /run ] || LOCK_FILE="/tmp/autocake.lock"
+exec 9<> "${LOCK_FILE}" || {
+  echo "ERROR: cannot open lock file ${LOCK_FILE}" >&2
+  exit 1
+}
+if ! flock -n 9; then
+  echo "ERROR: another autocake instance is running (lock: ${LOCK_FILE})" >&2
+  exit 1
+fi
 
 # Preflight: cake qdisc support. Probes by attaching a no-op cake qdisc to
 # the loopback interface (and removing it immediately). Catches the kernel
@@ -42,12 +65,6 @@ CURL_VER="$(curl --version | awk 'NR==1{print $2}')"
 if [ "$(printf '7.36.0\n%s\n' "${CURL_VER}" | sort -V | head -n1)" != "7.36.0" ]; then
   echo "ERROR: curl ${CURL_VER} is too old; need >= 7.36 for --next." >&2
   exit 1
-fi
-
-# Acquire a process-wide lock so two instances can't fight over ifb0/tc.
-# Re-execs once under flock with AUTOCAKE_LOCKED=1 so the inner run skips this.
-if [ -z "${AUTOCAKE_LOCKED:-}" ]; then
-  exec env AUTOCAKE_LOCKED=1 flock -n /tmp/autocake.lock "${SCRIPT_PATH}" "${@}"
 fi
 
 # --- autodetected from system state ---
@@ -241,7 +258,17 @@ sqm_apply() {
   tc qdisc replace dev "${IFB_DEV}" root cake bandwidth "${down_cap}Mbit" ${CAKE_INGRESS_OPTS}
 }
 
-WORKDIR=$(mktemp -d)
+WORKDIR=$(mktemp -d) || {
+  echo "ERROR: mktemp -d failed" >&2
+  exit 1
+}
+# SQM_COMMITTED flips to 1 after the final sqm_apply at the end of a
+# successful run. The EXIT trap reads it: any exit before that point
+# (preflight failure, set -u violation, SIGHUP, SIGTERM during search,
+# etc.) tears SQM down rather than leaving the link in an intermediate
+# shaped state. on_interrupt still calls sqm_off explicitly so the
+# message ordering on Ctrl+C is sensible; the EXIT path is idempotent.
+SQM_COMMITTED=0
 on_interrupt() {
   echo
   echo "Interrupted — disabling SQM"
@@ -252,8 +279,12 @@ on_interrupt() {
   sqm_off
   exit 130
 }
-trap 'rm -rf "${WORKDIR}"' EXIT
-trap on_interrupt INT TERM
+exit_cleanup() {
+  rm -rf "${WORKDIR:-}"
+  [ "${SQM_COMMITTED:-0}" -eq 1 ] || sqm_off
+}
+trap exit_cleanup EXIT
+trap on_interrupt INT TERM HUP
 
 # HTTP request-response time stats over LATENCY_URL.
 # Uses one curl invocation with --next so the TLS connection is reused;
@@ -265,22 +296,27 @@ http_latency_stats() {
   # at each --next, so a single timeout on the head only protects the
   # first request. Without per-request timeouts, a stalled request later
   # in the chain produces no time_total output and sinks the whole probe.
-  local args=(-s -o /dev/null --max-time "${LATENCY_TIMEOUT}"
-    -w '%{time_total}\n' "${LATENCY_URL}")
+  local args=()
   local i
-  for i in $(seq 2 "${count}"); do
-    args+=(--next -s -o /dev/null --max-time "${LATENCY_TIMEOUT}" -w '%{time_total}\n' "${LATENCY_URL}")
+  for ((i = 1; i <= count; i++)); do
+    [ "${i}" -gt 1 ] && args+=(--next)
+    args+=(-s -o /dev/null --max-time "${LATENCY_TIMEOUT}" -w '%{time_total}\n' "${LATENCY_URL}")
   done
+  # Drop the first sample (TLS handshake) and any sample that reached the
+  # per-request --max-time (curl still emits time_total ≈ LATENCY_TIMEOUT
+  # on timeout; without the LIMIT filter, two timed-out samples poison
+  # P95 by inflating it to the timeout value).
   curl "${args[@]}" 2> /dev/null |
     tail -n +2 |
-    sort -n |
-    awk '
-        { v[NR] = $1 }
+    sort -n -k1 |
+    awk -v LIMIT="${LATENCY_TIMEOUT}" '
+        BEGIN { LIMIT = LIMIT * 0.95 }
+        { if ($1 + 0 < LIMIT) v[++n] = $1 + 0 }
         END {
-          if (NR == 0) { print "0 0"; exit }
-          p25 = int((NR * 0.25) + 0.5); if (p25 < 1) p25 = 1
-          p75 = int((NR * 0.75) + 0.5); if (p75 < 1) p75 = 1; if (p75 > NR) p75 = NR
-          p95 = int((NR * 0.95) + 0.5); if (p95 < 1) p95 = 1; if (p95 > NR) p95 = NR
+          if (n == 0) { print "0 0"; exit }
+          p25 = int((n * 0.25) + 0.5); if (p25 < 1) p25 = 1
+          p75 = int((n * 0.75) + 0.5); if (p75 < 1) p75 = 1; if (p75 > n) p75 = n
+          p95 = int((n * 0.95) + 0.5); if (p95 < 1) p95 = 1; if (p95 > n) p95 = n
           printf "%.0f %.0f\n", v[p75] * 1000, (v[p95] - v[p25]) * 1000
         }
       '
@@ -293,7 +329,7 @@ http_latency_stats() {
 # probes need to be measured against to install a stable cap.
 idle_baseline() {
   local i p75 jit pairs=""
-  for i in $(seq 1 "${IDLE_BURSTS}"); do
+  for ((i = 1; i <= IDLE_BURSTS; i++)); do
     read -r p75 jit < <(http_latency_stats "${IDLE_BURST_SAMPLES}")
     [ -n "${p75:-}" ] && [ "${p75}" -gt 0 ] || continue
     pairs="${pairs}${p75} ${jit}"$'\n'
@@ -306,7 +342,7 @@ idle_baseline() {
   # Sort pairs by P75; pick the median row. With odd burst counts the
   # middle is unambiguous; with even counts we take the lower median,
   # which biases slightly toward the cleaner observation.
-  printf '%s' "${pairs}" | sort -n | awk '
+  printf '%s' "${pairs}" | sort -n -k1 | awk '
     { rows[NR] = $0 }
     END {
       mid = int((NR + 1) / 2)
@@ -320,7 +356,7 @@ measure_parallel() {
   local dir="${1}" bytes="${2}" streams="${3}"
   local pids=()
   local i
-  for i in $(seq 1 "${streams}"); do
+  for ((i = 1; i <= streams; i++)); do
     if [ "${dir}" = down ]; then
       download_bg "${WORKDIR}/s${i}" "${bytes}" "${CURL_TIMEOUT}" "$((i - 1))" '%{speed_download} %{http_code}\n'
     else
@@ -331,7 +367,7 @@ measure_parallel() {
   wait_all "${pids[@]}"
 
   local total_bps=0 bps http codes=""
-  for i in $(seq 1 "${streams}"); do
+  for ((i = 1; i <= streams; i++)); do
     read -r bps http < "${WORKDIR}/s${i}" 2> /dev/null || {
       bps=0
       http=0
@@ -382,7 +418,7 @@ loaded_latency_bidir() {
 
   local down_pids=() up_pids=()
   local i
-  for i in $(seq 1 "${STREAMS}"); do
+  for ((i = 1; i <= STREAMS; i++)); do
     download_bg /dev/null "${down_bytes}" "${LOAD_TIMEOUT}" "$((i - 1))" ''
     down_pids+=("$!")
     upload_bg /dev/null "${up_bytes}" "${LOAD_TIMEOUT}" ''
@@ -458,13 +494,15 @@ report_probe() {
 #   0 — pass (latency and jitter within thresholds)
 #   1 — quality fail (latency or jitter over threshold)
 #   2 — floor skip (down cap below STREAMING_GREAT_FLOOR with floor enabled)
-# The distinction lets the streaming-floor retry skip caps that already
-# failed on quality rather than re-probing them when the floor drops.
+#   3 — degenerate: cap rounds to 0 Mbit. MIN_MBIT plus the smallest
+#       STEP_PCTS rung make this unreachable in practice; the guard is
+#       defensive. Distinct from 1 so coarse_pass doesn't add it to
+#       QUALITY_FAILED — there's nothing about quality to record.
 try_pct() {
   local pct="${1}"
   local down_cap=$((DL * pct / 100))
   local up_cap=$((UL * pct / 100))
-  [ "${down_cap}" -ge 1 ] && [ "${up_cap}" -ge 1 ] || return 1
+  [ "${down_cap}" -ge 1 ] && [ "${up_cap}" -ge 1 ] || return 3
 
   if [ "${ENFORCE_STREAMING_FLOOR}" -eq 1 ] && [ "${down_cap}" -lt "${STREAMING_GREAT_FLOOR}" ]; then
     echo "  ${pct}% → ${down_cap} Mbit down would drop below Streaming-Great floor (${STREAMING_GREAT_FLOOR}); skipping"
@@ -524,7 +562,10 @@ coarse_pass() {
       BEST_LAT="${LAST_LAT}"
       return 0
       ;;
-    2)
+    2 | 3)
+      # 2: floor-skipped (the cap might pass on a floor-disabled retry).
+      # 3: degenerate cap (no measurement happened).
+      # Either way, nothing to record in QUALITY_FAILED.
       FAIL_PCT="${pct}"
       ;;
     *)
@@ -674,13 +715,19 @@ if [ "${BEST_PCT}" -eq 0 ]; then
   exit 1
 fi
 
+# Snapshot the pre-refine winner. If refine then advances BEST_PCT upward
+# and the recheck below rejects it, this is the rung we step back to —
+# it's already passed once, so it's a real fallback rather than an
+# arbitrary distance off the refined value.
+ORIG_COARSE_PCT="${BEST_PCT}"
+
 # Refine: binary-search upward between BEST_PCT (passing) and FAIL_PCT (failing,
 # or the ceiling if nothing failed above).
 if [ "${FAIL_PCT}" -gt "${BEST_PCT}" ]; then
   echo "Refining between ${BEST_PCT}% and ${FAIL_PCT}% (up to ${REFINE_ITERS} iterations)..."
   LO="${BEST_PCT}"
   HI="${FAIL_PCT}"
-  for _ in $(seq 1 "${REFINE_ITERS}"); do
+  for ((_iter = 1; _iter <= REFINE_ITERS; _iter++)); do
     MID=$(((LO + HI) / 2))
     [ "${MID}" -le "${LO}" ] && break
     if try_pct "${MID}"; then
@@ -708,7 +755,15 @@ if [ "${BEST_EFFORT}" -eq 1 ]; then
 elif is_pass "${RECHECK_LAT}" "${RECHECK_JIT}"; then
   echo "  stable"
 else
-  FALLBACK_PCT=$((BEST_PCT - 5))
+  # Prefer falling back to the coarse-pass winner if refine moved us
+  # above it — that rung passed once already, so it's a real candidate.
+  # Otherwise drop a small heuristic step (refine never advanced past
+  # coarse, so there's no prior passing rung to retreat to).
+  if [ "${BEST_PCT}" -gt "${ORIG_COARSE_PCT}" ]; then
+    FALLBACK_PCT="${ORIG_COARSE_PCT}"
+  else
+    FALLBACK_PCT=$((BEST_PCT - 5))
+  fi
   if [ "${FALLBACK_PCT}" -ge 30 ]; then
     echo "  not stable — stepping down to ${FALLBACK_PCT}%"
     if try_pct "${FALLBACK_PCT}"; then
@@ -784,6 +839,7 @@ fi
 
 # Refinement / fallback may have left a different cap active; re-apply best.
 sqm_apply "${BEST_UP}" "${BEST_DOWN}"
+SQM_COMMITTED=1
 echo "SQM ON at ${BEST_PCT}% — DOWN=${BEST_DOWN}Mbit UP=${BEST_UP}Mbit  [confidence: ${CONFIDENCE}]"
 if [ "${#CONF_NOTES[@]}" -gt 0 ]; then
   for _note in "${CONF_NOTES[@]}"; do

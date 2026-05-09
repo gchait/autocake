@@ -26,12 +26,13 @@ refines it with binary search, and re-verifies stability before committing.
 ```bash
 git clone https://github.com/gchait/autocake.git
 cd autocake
-sudo ./autocake.sh
+./autocake.sh
 ```
 
-Run on demand. `cake` state persists until reboot or `tc qdisc del`, so there's no daemon and nothing to schedule —
-re-run when your link, ISP plan, or topology changes. If you want it on `PATH`, alias it (
-`alias autocake='sudo ~/Projects/autocake/autocake.sh'`) or symlink it into `/usr/local/bin` yourself.
+The script auto-elevates with `sudo` if you aren't already root, so a normal invocation works — you'll be prompted for
+your password. Run on demand. `cake` state persists until reboot or `tc qdisc del`, so there's no daemon and nothing to
+schedule — re-run when your link, ISP plan, or topology changes. If you want it on `PATH`, alias it (
+`alias autocake='~/Projects/autocake/autocake.sh'`) or symlink it into `/usr/local/bin` yourself.
 
 To remove shaping:
 
