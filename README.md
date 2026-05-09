@@ -51,8 +51,9 @@ sudo ip link del ifb0
 | bash         | ≥ 3.1                                          | array-append `+=`                            |
 | Other tools  | `tc`, `ip`, `awk`, `head`, `flock`, `modprobe` | preflighted at startup                       |
 
-`autocake` validates kernel + iproute2 cake support at startup by attaching a no-op cake qdisc to `lo`, and checks curl
-`--next` via `--help all`. If either fails it exits with a clear error before doing any measurement work.
+`autocake` validates kernel + iproute2 cake support at startup by attaching a no-op cake qdisc to `lo`, and checks
+`curl --version` ≥ 7.36 (the release that introduced `--next`). If either fails it exits with a clear error before doing
+any measurement work.
 
 ## How it works
 

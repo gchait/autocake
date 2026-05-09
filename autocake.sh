@@ -202,6 +202,23 @@ download_bg() {
   fi
 }
 
+# Background-fire one upload stream against SPEEDTEST_UP_URL. Symmetric to
+# download_bg. The body is fed via process substitution rather than a pipe
+# subshell so curl is the direct background child — $! is curl's PID, and
+# on_interrupt's kill reaches it directly (no orphan grandchildren).
+upload_bg() {
+  local out="$1" bytes="$2" timeout="$3" wfmt="$4"
+  local args=(-s -o /dev/null --max-time "${timeout}" -X POST --data-binary @-)
+  [ -n "${wfmt}" ] && args+=(-w "${wfmt}")
+  curl "${args[@]}" "${SPEEDTEST_UP_URL}" < <(head -c "${bytes}" /dev/zero) > "${out}" &
+}
+
+# Reap a list of background PIDs without aborting on already-exited ones.
+wait_all() {
+  local pid
+  for pid in "$@"; do wait "${pid}" 2> /dev/null || true; done
+}
+
 sqm_off() {
   tc qdisc del dev "${IFACE}" ingress 2> /dev/null || true
   tc qdisc del dev "${IFACE}" root 2> /dev/null || true
@@ -307,14 +324,11 @@ measure_parallel() {
     if [ "${dir}" = down ]; then
       download_bg "${WORKDIR}/s${i}" "${bytes}" "${CURL_TIMEOUT}" "$((i - 1))" '%{speed_download} %{http_code}\n'
     else
-      (head -c "${bytes}" /dev/zero |
-        curl -s -o /dev/null --max-time "${CURL_TIMEOUT}" -X POST --data-binary @- \
-          -w '%{speed_upload} %{http_code}\n' \
-          "${SPEEDTEST_UP_URL}") > "${WORKDIR}/s${i}" &
+      upload_bg "${WORKDIR}/s${i}" "${bytes}" "${CURL_TIMEOUT}" '%{speed_upload} %{http_code}\n'
     fi
     pids+=("$!")
   done
-  for pid in "${pids[@]}"; do wait "${pid}" 2> /dev/null || true; done
+  wait_all "${pids[@]}"
 
   local total_bps=0 bps http codes=""
   for i in $(seq 1 "${streams}"); do
@@ -371,9 +385,7 @@ loaded_latency_bidir() {
   for i in $(seq 1 "${STREAMS}"); do
     download_bg /dev/null "${down_bytes}" "${LOAD_TIMEOUT}" "$((i - 1))" ''
     down_pids+=("$!")
-    (head -c "${up_bytes}" /dev/zero |
-      curl -s -o /dev/null --max-time "${LOAD_TIMEOUT}" -X POST --data-binary @- \
-        "${SPEEDTEST_UP_URL}") > /dev/null &
+    upload_bg /dev/null "${up_bytes}" "${LOAD_TIMEOUT}" ''
     up_pids+=("$!")
   done
 
@@ -387,15 +399,23 @@ loaded_latency_bidir() {
     kill -0 "${pid}" 2> /dev/null && alive_up=$((alive_up + 1))
   done
   if [ "${alive_down}" -eq 0 ] || [ "${alive_up}" -eq 0 ]; then
-    for pid in "${down_pids[@]}" "${up_pids[@]}"; do wait "${pid}" 2> /dev/null || true; done
+    wait_all "${down_pids[@]}" "${up_pids[@]}"
     echo "0 0"
     return
   fi
 
   local lat jit
   read -r lat jit < <(http_latency_stats "${LOADED_SAMPLES}")
-  for pid in "${down_pids[@]}" "${up_pids[@]}"; do wait "${pid}" 2> /dev/null || true; done
+  wait_all "${down_pids[@]}" "${up_pids[@]}"
   echo "${lat:-0} ${jit:-0}"
+}
+
+# Predicate: true iff (lat, jit) clears both thresholds and the probe
+# actually produced samples (lat>0). Single source of truth for the
+# pass condition — classify_tag and every gate-check share it.
+is_pass() {
+  local lat="${1}" jit="${2}"
+  [ "${lat}" -gt 0 ] && [ "${lat}" -le "${THRESHOLD_MS}" ] && [ "${jit}" -le "${JITTER_THRESHOLD_MS}" ]
 }
 
 # Classify a (lat, jit) pair against the configured thresholds and echo a
@@ -409,18 +429,28 @@ classify_tag() {
     echo "FAIL (probe stalled)"
     return
   fi
+  if is_pass "${lat}" "${jit}"; then
+    echo "PASS"
+    return
+  fi
   local lat_bad=0 jit_bad=0
   [ "${lat}" -gt "${THRESHOLD_MS}" ] && lat_bad=1
   [ "${jit}" -gt "${JITTER_THRESHOLD_MS}" ] && jit_bad=1
-  if [ "${lat_bad}" -eq 0 ] && [ "${jit_bad}" -eq 0 ]; then
-    echo "PASS"
-  elif [ "${lat_bad}" -eq 1 ] && [ "${jit_bad}" -eq 1 ]; then
+  if [ "${lat_bad}" -eq 1 ] && [ "${jit_bad}" -eq 1 ]; then
     echo "FAIL (latency+jitter)"
   elif [ "${lat_bad}" -eq 1 ]; then
     echo "FAIL (latency)"
   else
     echo "FAIL (jitter)"
   fi
+}
+
+# Print one probe summary line: "<prefix>P75=<lat>ms (≤T) jitter=<jit>ms
+# (≤J) [<tag>]". Single format string for every measurement report so the
+# search trace, unshaped check, recheck, and fallback recheck all line up.
+report_probe() {
+  local prefix="${1}" lat="${2}" jit="${3}"
+  echo "${prefix}P75=${lat}ms (≤${THRESHOLD_MS}) jitter=${jit}ms (≤${JITTER_THRESHOLD_DISPLAY}) [$(classify_tag "${lat}" "${jit}")]"
 }
 
 # try_pct <pct>: apply cake at pct of measured bandwidth, verify under
@@ -459,10 +489,8 @@ try_pct() {
     BEST_NEARMISS_UP="${up_cap}"
   fi
 
-  local tag
-  tag=$(classify_tag "${lat}" "${jit}")
-  echo "  ${pct}% → ${down_cap}/${up_cap} Mbit → P75: ${lat}ms (≤${THRESHOLD_MS}) jitter: ${jit}ms (≤${JITTER_THRESHOLD_DISPLAY}) [${tag}]"
-  [ "${tag}" = "PASS" ] && return 0
+  report_probe "  ${pct}% → ${down_cap}/${up_cap} Mbit → " "${lat}" "${jit}"
+  is_pass "${lat}" "${jit}" && return 0
   return 1
 }
 
@@ -597,8 +625,8 @@ echo "Target: loaded latency ≤ ${THRESHOLD_MS}ms under bidirectional load"
 # top of the run, so this measures the genuine unshaped behavior.
 echo "Testing unshaped link under bidirectional load..."
 read -r UNSHAPED_LAT UNSHAPED_JIT < <(loaded_latency_bidir "${DL}" "${UL}")
-echo "  unshaped: P75=${UNSHAPED_LAT}ms (≤${THRESHOLD_MS}) jitter=${UNSHAPED_JIT}ms (≤${JITTER_THRESHOLD_DISPLAY}) [$(classify_tag "${UNSHAPED_LAT}" "${UNSHAPED_JIT}")]"
-if [ "${UNSHAPED_LAT}" -gt 0 ] && [ "${UNSHAPED_LAT}" -le "${THRESHOLD_MS}" ] && [ "${UNSHAPED_JIT}" -le "${JITTER_THRESHOLD_MS}" ]; then
+report_probe "  unshaped: " "${UNSHAPED_LAT}" "${UNSHAPED_JIT}"
+if is_pass "${UNSHAPED_LAT}" "${UNSHAPED_JIT}"; then
   echo "SQM not needed — link already meets thresholds unshaped. Leaving off."
   exit 0
 fi
@@ -673,11 +701,11 @@ fi
 echo "Re-verifying stability at ${BEST_PCT}%..."
 sqm_apply "${BEST_UP}" "${BEST_DOWN}"
 read -r RECHECK_LAT RECHECK_JIT < <(loaded_latency_bidir "${BEST_DOWN}" "${BEST_UP}")
-echo "  recheck: P75=${RECHECK_LAT}ms (≤${THRESHOLD_MS}) jitter=${RECHECK_JIT}ms (≤${JITTER_THRESHOLD_DISPLAY}) [$(classify_tag "${RECHECK_LAT}" "${RECHECK_JIT}")]"
+report_probe "  recheck: " "${RECHECK_LAT}" "${RECHECK_JIT}"
 USED_STEPDOWN=0
 if [ "${BEST_EFFORT}" -eq 1 ]; then
   echo "  best-effort cap; strict recheck skipped (link can't meet 'Great' thresholds anyway)"
-elif [ "${RECHECK_LAT}" -gt 0 ] && [ "${RECHECK_LAT}" -le "${THRESHOLD_MS}" ] && [ "${RECHECK_JIT}" -le "${JITTER_THRESHOLD_MS}" ]; then
+elif is_pass "${RECHECK_LAT}" "${RECHECK_JIT}"; then
   echo "  stable"
 else
   FALLBACK_PCT=$((BEST_PCT - 5))
@@ -686,11 +714,10 @@ else
     if try_pct "${FALLBACK_PCT}"; then
       # Double-check the fallback before committing — the same transient
       # variance that broke the original recheck could have produced a
-      # false-pass on the step-down.
-      sqm_apply "${LAST_UP}" "${LAST_DOWN}"
+      # false-pass on the step-down. try_pct already left the cap installed.
       read -r FB_LAT FB_JIT < <(loaded_latency_bidir "${LAST_DOWN}" "${LAST_UP}")
-      echo "  fallback recheck: P75=${FB_LAT}ms (≤${THRESHOLD_MS}) jitter=${FB_JIT}ms (≤${JITTER_THRESHOLD_DISPLAY}) [$(classify_tag "${FB_LAT}" "${FB_JIT}")]"
-      if [ "${FB_LAT}" -gt 0 ] && [ "${FB_LAT}" -le "${THRESHOLD_MS}" ] && [ "${FB_JIT}" -le "${JITTER_THRESHOLD_MS}" ]; then
+      report_probe "  fallback recheck: " "${FB_LAT}" "${FB_JIT}"
+      if is_pass "${FB_LAT}" "${FB_JIT}"; then
         BEST_PCT="${FALLBACK_PCT}"
         BEST_DOWN="${LAST_DOWN}"
         BEST_UP="${LAST_UP}"
