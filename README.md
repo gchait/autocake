@@ -108,7 +108,3 @@ These are inherent to the approach, not knobs:
 - **Wireless link variance dominates the cap.** On Wi-Fi, especially through extenders, the measured "best cap" can
   swing 2× between runs because the radio environment isn't stationary. `autocake` chooses the right cap *for the link
   as it was during measurement*, not a permanent fixed point. Re-run when conditions change.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
