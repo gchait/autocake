@@ -21,16 +21,16 @@ set -uo pipefail
 # would canonicalize symlinks away, and we need the symlink basename
 # (e.g. autocake-off) to survive elevation so argv[0] dispatch works.
 case "${0}" in
-  /*) INVOKED_AS="${0}" ;;
-  *) INVOKED_AS="${PWD}/${0}" ;;
+/*) INVOKED_AS="${0}" ;;
+*) INVOKED_AS="${PWD}/${0}" ;;
 esac
 
 # Mode is decided by the symlink basename. Anything ending in -off (or
 # -off.sh, for the in-repo `ln -s autocake.sh autocake-off` flow) means
 # tear down; anything else means measure and apply.
 case "${0##*/}" in
-  *-off | *-off.sh) MODE=off ;;
-  *) MODE=on ;;
+*-off | *-off.sh) MODE=off ;;
+*) MODE=on ;;
 esac
 
 if [ "${EUID}" -ne 0 ]; then
