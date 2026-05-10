@@ -286,6 +286,17 @@ download_bg() {
 # download_bg. The body is fed via process substitution rather than a pipe
 # subshell so curl is the direct background child — $! is curl's PID, and
 # on_interrupt's kill reaches it directly (no orphan grandchildren).
+#
+# Upload is single-mirror by design: there isn't a public pool of
+# unauthenticated POST endpoints to round-robin across (most require
+# auth, session tokens, or CORS-protected origins). Concurrent upload
+# load is bounded by STREAMS, which is itself capped at the download
+# pool size — so when downloads are forced to 1-2 streams (the common
+# case with mirror flakiness), uploads inherit the same cap. With a
+# richer download pool (STREAMS=3+), uploads concentrate on Cloudflare;
+# if a stream 429s, measure_parallel filters its contribution (HTTP
+# code != 200/206 → 0 bps), so the failure mode is a slightly under-
+# counted UL measurement, not a hard failure or stalled probe.
 upload_bg() {
   local out="$1" bytes="$2" timeout="$3" wfmt="$4"
   local args=(-s -o /dev/null --max-time "${timeout}" -X POST --data-binary @-)
@@ -825,6 +836,13 @@ if is_pass "${UNSHAPED_LAT}" "${UNSHAPED_JIT}"; then
 fi
 
 # Coarse pass: walk the step ladder until one passes.
+# QUALITY_FAILED accumulates space-delimited integer pcts; the membership
+# test in coarse_pass (`case " ${QUALITY_FAILED} " in *" ${pct} "*)`)
+# pads with spaces on both ends so e.g. "5" doesn't match inside "35".
+# The current STEP_PCTS values (35/50/65/80/92) have no substring
+# overlap, but if you add overlapping values (5, 50, 500) the format is
+# still safe — don't switch to a non-space delimiter or to bare
+# concatenation without re-checking the match.
 QUALITY_FAILED=""
 BEST_NEARMISS_LAT=999999
 BEST_NEARMISS_JIT=999999
