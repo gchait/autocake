@@ -39,7 +39,7 @@ To remove shaping:
 ```bash
 sudo tc qdisc del dev <iface> root
 sudo tc qdisc del dev <iface> ingress
-sudo ip link del ifb0
+sudo ip link del ifb-autocake
 ```
 
 ## Requirements
@@ -67,9 +67,11 @@ any measurement work.
 4. **Adaptive thresholds** — loaded latency must stay within `idle_P75 + clamp(2 × jitter, 8, 25) ms`. Loaded jitter
    must stay within Cloudflare AIM's "Great" ceiling (30 ms) — unless the link's idle jitter already exceeds that, in
    which case the gate is dropped (no cap can quiet a noisy radio).
-5. **Throughput** — three parallel HTTP streams in each direction, distributed round-robin across a probe-validated pool
-   of mirrors (Cloudflare + OVH + Hetzner + Tele2). Pool size matters: a single mirror that 429s under real load can't
-   zero out the measurement, and a slow single path can't anchor it below the link's true capacity.
+5. **Throughput** — up to three parallel HTTP streams in each direction, distributed round-robin across a probe-validated
+   pool of mirrors (Cloudflare + OVH + Hetzner + Tele2). Stream count is capped at the live pool size so no single mirror
+   gets two streams (Cloudflare 429s under sustained 2-stream load, which would cascade into stalled probes). Pool size
+   matters: a single mirror that 429s under real load can't zero out the measurement, and a slow single path can't anchor
+   it below the link's true capacity.
 6. **Shape-or-skip** — runs the loaded probe with no shaping at all. If the unshaped link already passes both gates,
    exits without installing any cap. Catches well-behaved fiber where any cap below 100% is pure loss.
 7. **Coarse pass** — walks 92% → 80% → 65% → 50% → 35% of measured bandwidth, applying cake at each step under

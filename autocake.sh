@@ -27,7 +27,8 @@ for cmd in tc curl ip awk head flock modprobe; do
   }
 done
 
-# Acquire a host-wide lock so two instances can't fight over ifb0/tc. The
+# Acquire a host-wide lock so two instances can't fight over the ifb device
+# or tc state. The
 # lock lives on FD 9 for the lifetime of the script — when this process
 # exits (any reason) the kernel closes the FD and the lock releases.
 #
@@ -128,7 +129,12 @@ LOAD_TIMEOUT=12
 LATENCY_TIMEOUT=10
 CAKE_OPTS="besteffort"
 CAKE_INGRESS_OPTS="besteffort wash"
-IFB_DEV="ifb0"
+# Use a project-namespaced ifb device (12 chars; under IFNAMSIZ=15) so we
+# never collide with an ifb0 that another shaper / VPN / monitor on the
+# same host already owns. Without this, sqm_off's `ip link del` would
+# happily destroy a foreign ifb0 — and `ip link add` returning EEXIST
+# would silently make us reuse it.
+IFB_DEV="ifb-autocake"
 MIN_MBIT=5
 STREAMING_GREAT_FLOOR=100   # Cloudflare's Streaming-Great download spec (Mbit)
 STREAMING_FLOOR_HEADROOM=10 # only enforce floor when DL exceeds it by this
@@ -386,15 +392,19 @@ measure_parallel() {
     }
     codes="${codes}${codes:+,}${http:-curl-fail}"
     # 200 = full body (Cloudflare template), 206 = Partial Content (Range mirror)
+    # %.0f keeps the running sum in plain decimal: awk's default `print`
+    # would switch to %.6g (e.g. "1.23e+08") above ~1e7, which then has
+    # to be re-parsed by the next awk and is also locale-sensitive on
+    # systems where LC_NUMERIC uses a comma decimal mark.
     if [ "${http:-0}" = 200 ] || [ "${http:-0}" = 206 ]; then
-      total_bps=$(awk -v t="${total_bps}" -v b="${bps:-0}" 'BEGIN{print t+b}')
+      total_bps=$(awk -v t="${total_bps}" -v b="${bps:-0}" 'BEGIN{printf "%.0f", t+b}')
     fi
     rm -f "${WORKDIR}/s${i}"
   done
   # Surface per-stream HTTP codes when no stream succeeded so the caller's
   # error message points at why (rate limit / CDN error / curl failure).
   [ "${total_bps}" = 0 ] && echo "[${dir}: HTTP codes ${codes}]" >&2
-  awk -v b="${total_bps}" 'BEGIN{printf "%d", b*8/1e6 + 0.5}'
+  awk -v b="${total_bps}" 'BEGIN{printf "%d", (b*8/1e6) + 0.5}'
 }
 
 # Per-stream bytes so STREAMS streams together sustain LOAD_DURATION_SEC at
@@ -781,6 +791,7 @@ sqm_apply "${BEST_UP}" "${BEST_DOWN}"
 read -r RECHECK_LAT RECHECK_JIT < <(loaded_latency_bidir "${BEST_DOWN}" "${BEST_UP}")
 report_probe "  recheck: " "${RECHECK_LAT}" "${RECHECK_JIT}"
 USED_STEPDOWN=0
+UNSTABLE_COMMIT=0
 if [ "${BEST_EFFORT}" -eq 1 ]; then
   echo "  best-effort cap; strict recheck skipped (link can't meet 'Great' thresholds anyway)"
 elif is_pass "${RECHECK_LAT}" "${RECHECK_JIT}"; then
@@ -797,7 +808,10 @@ else
   fi
   if [ "${FALLBACK_PCT}" -ge 30 ]; then
     echo "  not stable — stepping down to ${FALLBACK_PCT}%"
-    if try_pct "${FALLBACK_PCT}"; then
+    try_pct "${FALLBACK_PCT}"
+    rc=$?
+    case "${rc}" in
+    0)
       # Double-check the fallback before committing — the same transient
       # variance that broke the original recheck could have produced a
       # false-pass on the step-down. try_pct already left the cap installed.
@@ -814,10 +828,24 @@ else
         echo "  fallback stable"
       else
         echo "  fallback also unstable — keeping ${BEST_PCT}% (link may be transient)"
+        UNSTABLE_COMMIT=1
       fi
-    fi
+      ;;
+    2)
+      # Floor blocks the fallback rung. The original recheck still failed,
+      # so the committed cap is genuinely unstable — the floor only tells
+      # us we can't legally try lower, not that the cap is good.
+      echo "  fallback rung below Streaming-Great floor — keeping ${BEST_PCT}%"
+      UNSTABLE_COMMIT=1
+      ;;
+    *)
+      echo "  step-down probe also failed — keeping ${BEST_PCT}% (link may be transient)"
+      UNSTABLE_COMMIT=1
+      ;;
+    esac
   else
     echo "  not stable but already at floor — keeping ${BEST_PCT}%"
+    UNSTABLE_COMMIT=1
   fi
 fi
 
@@ -843,10 +871,15 @@ else
   CONF_SCORE=$((CONF_SCORE - 1))
   CONF_NOTES+=("only 1 download backend in pool")
 fi
+# Recheck-vs-search delta: rewards consistency only when the recheck
+# actually passed. Two failing samples that happen to agree aren't
+# evidence the cap is good — they're evidence the cap is consistently
+# bad. The drift penalty applies regardless: large run-to-run swings
+# always reduce confidence.
 if [ "${BEST_LAT:-0}" -gt 0 ] && [ "${RECHECK_LAT:-0}" -gt 0 ]; then
   RECHECK_DELTA=$((RECHECK_LAT - BEST_LAT))
   [ "${RECHECK_DELTA}" -lt 0 ] && RECHECK_DELTA=$((-RECHECK_DELTA))
-  if [ "${RECHECK_DELTA}" -le 3 ]; then
+  if [ "${RECHECK_DELTA}" -le 3 ] && is_pass "${RECHECK_LAT}" "${RECHECK_JIT}"; then
     CONF_SCORE=$((CONF_SCORE + 1))
   elif [ "${RECHECK_DELTA}" -ge 8 ]; then
     CONF_SCORE=$((CONF_SCORE - 1))
@@ -856,6 +889,9 @@ fi
 if [ "${BEST_EFFORT:-0}" -eq 1 ]; then
   CONF_SCORE=$((CONF_SCORE - 2))
   CONF_NOTES+=("best-effort cap (link can't reach Cloudflare 'Great')")
+elif [ "${UNSTABLE_COMMIT:-0}" -eq 1 ]; then
+  CONF_SCORE=$((CONF_SCORE - 2))
+  CONF_NOTES+=("final cap failed stability rechecks")
 elif [ "${USED_STEPDOWN}" -eq 1 ]; then
   CONF_SCORE=$((CONF_SCORE - 1))
   CONF_NOTES+=("step-down used after recheck instability")
