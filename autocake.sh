@@ -228,7 +228,8 @@ probe_download_backends() {
     url="${entry%% *}"
     size="${entry#* }"
     [ "${size}" = "${entry}" ] && size=0
-    if [[ "${url}" == *%BYTES%* ]]; then
+    case "${url}" in
+    *%BYTES%*)
       probe_url="${url//%BYTES%/100000}"
       code=$(curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${probe_url}" 2> /dev/null || true)
       code="${code:-000}"
@@ -236,14 +237,16 @@ probe_download_backends() {
       if [ "${code}" = "200" ]; then
         WORKING_DOWNLOAD_BACKENDS+=("${url}|0")
       fi
-    else
+      ;;
+    *)
       code=$(curl -s -o /dev/null --max-time 8 -r 0-99999 -w '%{http_code}' "${url}" 2> /dev/null || true)
       code="${code:-000}"
       echo "  probe: ${url} (Range 0-99999) → ${code}" >&2
       if [ "${code}" = "206" ] || [ "${code}" = "200" ]; then
         WORKING_DOWNLOAD_BACKENDS+=("${url}|${size}")
       fi
-    fi
+      ;;
+    esac
   done
   [ "${#WORKING_DOWNLOAD_BACKENDS[@]}" -gt 0 ]
 }
@@ -316,12 +319,29 @@ sqm_off() {
 
 sqm_apply() {
   local up_cap="${1}" down_cap="${2}"
+  # Critical commands are checked explicitly: we run under `set -uo
+  # pipefail` (no -e), so a silent failure here would let try_pct
+  # measure latency on an unshaped link and report a false pass. The
+  # preflight (cake on lo) catches the common kernel/iproute2 case, but
+  # ifb-module load failures and tc surprises (broken qdisc-replace
+  # races, hardware offload conflicts) only surface at apply time.
+  # On any failure, exit non-zero — the EXIT trap runs sqm_off because
+  # SQM_COMMITTED is still 0, so we leave clean kernel state behind.
   modprobe ifb 2> /dev/null || true
   ip link add "${IFB_DEV}" type ifb 2> /dev/null || true
-  ip link set dev "${IFB_DEV}" up
+  ip link set dev "${IFB_DEV}" up || {
+    echo "ERROR: cannot bring ${IFB_DEV} up — ifb support unavailable?" >&2
+    exit 1
+  }
   # shellcheck disable=SC2086
-  tc qdisc replace dev "${IFACE}" root cake bandwidth "${up_cap}Mbit" ${CAKE_OPTS}
-  tc qdisc replace dev "${IFACE}" handle ffff: ingress
+  tc qdisc replace dev "${IFACE}" root cake bandwidth "${up_cap}Mbit" ${CAKE_OPTS} || {
+    echo "ERROR: cake egress qdisc apply failed on ${IFACE}" >&2
+    exit 1
+  }
+  tc qdisc replace dev "${IFACE}" handle ffff: ingress || {
+    echo "ERROR: ingress qdisc apply failed on ${IFACE}" >&2
+    exit 1
+  }
   # The redirect filter is one-shot per ingress qdisc: pinning pref +
   # handle keeps it from accumulating across the search's many sqm_apply
   # calls (without those, a 10-iteration search leaves 10 stacked
@@ -333,7 +353,10 @@ sqm_apply() {
     protocol all matchall action mirred egress redirect dev "${IFB_DEV}" \
     2> /dev/null || true
   # shellcheck disable=SC2086
-  tc qdisc replace dev "${IFB_DEV}" root cake bandwidth "${down_cap}Mbit" ${CAKE_INGRESS_OPTS}
+  tc qdisc replace dev "${IFB_DEV}" root cake bandwidth "${down_cap}Mbit" ${CAKE_INGRESS_OPTS} || {
+    echo "ERROR: cake ingress qdisc apply failed on ${IFB_DEV}" >&2
+    exit 1
+  }
 }
 
 WORKDIR=$(mktemp -d) || {
@@ -709,7 +732,7 @@ IDLE_JITTER="${IDLE_JITTER:-0}"
 echo "  idle P75: ${IDLE}ms   idle jitter (P95-P25): ${IDLE_JITTER}ms"
 
 if [ "${IDLE}" -le 0 ]; then
-  echo "ERROR: idle latency probe failed — Cloudflare unreachable?" >&2
+  echo "ERROR: idle latency probe failed — ${LATENCY_URL} unreachable?" >&2
   exit 1
 fi
 
