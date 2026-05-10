@@ -78,6 +78,18 @@ if ! flock -n 9; then
   exit 1
 fi
 
+# State file: written at the end of a successful on-mode run so off-mode
+# (and the next on-mode run, in case the default route has changed) can
+# clean up the iface that was actually shaped, not whichever iface
+# happens to be the default route at teardown time. Lives in /run so it
+# inherits the same root-only 0700 dir the lock uses, and so it's wiped
+# at reboot — exactly matching cake's own kernel-only persistence.
+STATE_FILE="${LOCK_DIR}/state"
+SAVED_IFACE=""
+if [ -r "${STATE_FILE}" ]; then
+  SAVED_IFACE=$(awk -F= '/^iface=/{print $2; exit}' "${STATE_FILE}")
+fi
+
 # On-mode preflights only. Off-mode neither shapes nor probes, so cake
 # kernel support and curl version are irrelevant to teardown — and a user
 # reverting state on a system with stale tooling should still succeed.
@@ -284,9 +296,19 @@ wait_all() {
   for pid in "$@"; do wait "${pid}" 2> /dev/null || true; done
 }
 
+# sqm_off [iface] — tear down cake on the named iface (default: $IFACE)
+# and remove the project-namespaced ifb device. Accepting an iface
+# argument lets the off-mode dispatch and the on-mode initial cleanup
+# handle the case where the default route has shifted between apply and
+# revert (laptop docked, VPN swing): we read the iface that was actually
+# shaped from the persisted state file and clean *that* one, not the
+# current default route.
 sqm_off() {
-  tc qdisc del dev "${IFACE}" ingress 2> /dev/null || true
-  tc qdisc del dev "${IFACE}" root 2> /dev/null || true
+  local iface="${1:-${IFACE:-}}"
+  if [ -n "${iface}" ]; then
+    tc qdisc del dev "${iface}" ingress 2> /dev/null || true
+    tc qdisc del dev "${iface}" root 2> /dev/null || true
+  fi
   tc qdisc del dev "${IFB_DEV}" root 2> /dev/null || true
   ip link set dev "${IFB_DEV}" down 2> /dev/null || true
   ip link del "${IFB_DEV}" 2> /dev/null || true
@@ -300,8 +322,16 @@ sqm_apply() {
   # shellcheck disable=SC2086
   tc qdisc replace dev "${IFACE}" root cake bandwidth "${up_cap}Mbit" ${CAKE_OPTS}
   tc qdisc replace dev "${IFACE}" handle ffff: ingress
-  tc filter replace dev "${IFACE}" parent ffff: protocol all matchall \
-    action mirred egress redirect dev "${IFB_DEV}"
+  # The redirect filter is one-shot per ingress qdisc: pinning pref +
+  # handle keeps it from accumulating across the search's many sqm_apply
+  # calls (without those, a 10-iteration search leaves 10 stacked
+  # filters). The kernel can't atomically `replace` a matchall+mirred
+  # filter, so the second and later calls return EEXIST — that's
+  # harmless (the original filter is still installed and still pointing
+  # at ifb-autocake) but noisy, hence the stderr suppression.
+  tc filter replace dev "${IFACE}" parent ffff: pref 10 handle 0x1 \
+    protocol all matchall action mirred egress redirect dev "${IFB_DEV}" \
+    2> /dev/null || true
   # shellcheck disable=SC2086
   tc qdisc replace dev "${IFB_DEV}" root cake bandwidth "${down_cap}Mbit" ${CAKE_INGRESS_OPTS}
 }
@@ -636,19 +666,35 @@ coarse_pass() {
 
 # Off-mode dispatch. By here IFACE is detected (or tolerated empty),
 # IFB_DEV is set, sqm_off is defined, and the EXIT/INT trap is armed —
-# everything teardown needs. Mark SQM_COMMITTED=1 afterward so the EXIT
-# trap doesn't re-run sqm_off redundantly: in this mode the kernel state
-# is already exactly what we want it to be (no shaping at all).
+# everything teardown needs. Prefer the saved iface (the one the previous
+# on-mode run actually shaped) over the current default route, so we
+# clean up the right device when the route has shifted since apply time.
+# Mark SQM_COMMITTED=1 afterward so the EXIT trap doesn't re-run sqm_off
+# redundantly: in this mode the kernel state is already exactly what we
+# want (no shaping at all).
 if [ "${MODE}" = off ]; then
-  sqm_off
+  target_iface="${SAVED_IFACE:-${IFACE}}"
+  sqm_off "${target_iface}"
+  rm -f "${STATE_FILE}"
   SQM_COMMITTED=1
-  echo "autocake SQM removed"
+  if [ -n "${target_iface}" ]; then
+    echo "autocake SQM removed from ${target_iface}"
+  else
+    echo "autocake SQM removed (no iface state to clean)"
+  fi
   exit 0
 fi
 
 # ---------- Main flow ----------
 
+# Initial cleanup: clear any cake state on the current iface, plus the
+# iface a previous run shaped if it was different (laptop dock, route
+# change). Without this second pass, a wlan0 → eth0 swap between runs
+# would leave wlan0's mirred filter pointing at the now-deleted ifb.
 sqm_off
+if [ -n "${SAVED_IFACE}" ] && [ "${SAVED_IFACE}" != "${IFACE}" ]; then
+  sqm_off "${SAVED_IFACE}"
+fi
 echo "Interface: ${IFACE}"
 echo "Selecting latency probe backend..."
 if ! select_latency_backend; then
@@ -949,6 +995,19 @@ fi
 # Refinement / fallback may have left a different cap active; re-apply best.
 sqm_apply "${BEST_UP}" "${BEST_DOWN}"
 SQM_COMMITTED=1
+# Persist iface (and a few diagnostic fields) so off-mode can clean up
+# the right device even if the default route shifts before teardown.
+# Stored in /run, so the file vanishes at reboot — same lifetime as the
+# kernel cake state itself. Best-effort: a write failure here doesn't
+# undo the successful apply we just made.
+{
+  printf 'iface=%s\n' "${IFACE}"
+  printf 'ifb=%s\n' "${IFB_DEV}"
+  printf 'pct=%s\n' "${BEST_PCT}"
+  printf 'down_mbit=%s\n' "${BEST_DOWN}"
+  printf 'up_mbit=%s\n' "${BEST_UP}"
+  printf 'applied_at=%s\n' "$(date -u +%FT%TZ)"
+} > "${STATE_FILE}" 2> /dev/null || true
 echo "SQM ON at ${BEST_PCT}% — DOWN=${BEST_DOWN}Mbit UP=${BEST_UP}Mbit  [confidence: ${CONFIDENCE} (${CONF_SCORE})]"
 if [ "${#CONF_NOTES[@]}" -gt 0 ]; then
   for _note in "${CONF_NOTES[@]}"; do
