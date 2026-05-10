@@ -30,17 +30,96 @@ cd autocake
 ```
 
 The script auto-elevates with `sudo` if you aren't already root, so a normal invocation works — you'll be prompted for
-your password. Run on demand. `cake` state persists until reboot or `tc qdisc del`, so there's no daemon and nothing to
-schedule — re-run when your link, ISP plan, or topology changes. If you want it on `PATH`, alias it (
-`alias autocake='~/Projects/autocake/autocake.sh'`) or symlink it into `/usr/local/bin` yourself.
+your password. Run on demand. `cake` state persists until reboot or until you tear it down, so there's no daemon and
+nothing to schedule — re-run when your link, ISP plan, or topology changes. If you want it on `PATH`, alias it
+(`alias autocake='~/Projects/autocake/autocake.sh'`) or symlink it into `/usr/local/bin` yourself.
 
-To remove shaping:
+To remove shaping, invoke the script as `autocake-off` — same script, the symlink basename selects teardown mode:
 
 ```bash
-sudo tc qdisc del dev <iface> root
-sudo tc qdisc del dev <iface> ingress
-sudo ip link del ifb-autocake
+ln -s autocake.sh autocake-off   # one-time, in the repo
+./autocake-off                   # tear down whenever you want
 ```
+
+(Mode is decided by `argv[0]`, not a flag or env var, so the "zero flags / zero env vars" promise stands.)
+
+## Optional: run on every boot (systemd)
+
+`cake` state lives in the kernel only and is wiped at every reboot, so by default you re-run `autocake` after each boot.
+If you'd rather have it measure-and-apply automatically at startup, install a tiny systemd unit. Re-measuring every boot
+(rather than persisting the last cap to disk) is deliberate: on a Wi-Fi or extender link the right cap depends on
+*current* RF conditions, not yesterday's, and a fresh ~30 s probe at boot is far cheaper than installing a stale cap.
+
+**Step 1 — put the script somewhere stable, with both invocation names**. The service file references absolute paths,
+so the script can't sit in a directory that might be moved or deleted:
+
+```bash
+sudo install -m 0755 autocake.sh /usr/local/bin/autocake
+sudo ln -s autocake /usr/local/bin/autocake-off
+```
+
+The symlink is what makes `ExecStop=` clean: invoking the same script as `autocake-off` runs the teardown branch and
+exits.
+
+**Step 2 — write the unit file** to `/etc/systemd/system/autocake.service`:
+
+```ini
+[Unit]
+Description=autocake — measure link and apply cake SQM
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/autocake
+ExecStop=/usr/local/bin/autocake-off
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Four points on the syntax, since they're easy to get wrong:
+
+- `Wants=network-online.target` + `After=network-online.target` together are the documented way to wait for *real*
+  connectivity. `network.target` only signals that the network *stack* is up, which is too early — the throughput probe
+  needs an actually-routable internet path. ([systemd.io: Running Services After the Network Is Up](
+  https://systemd.io/NETWORK_ONLINE/))
+- `Type=oneshot` + `RemainAfterExit=yes` is the right pair for a measurement script: systemd waits for `autocake` to
+  finish (so dependent units don't race against an unshaped link), and then keeps the unit `active` afterward instead of
+  flipping to `inactive (dead)` and looking like a failure in `systemctl status`. ([Red Hat: oneshot service type](
+  https://www.redhat.com/en/blog/systemd-oneshot-service))
+- `ExecStop=/usr/local/bin/autocake-off` makes `systemctl stop` (and `disable --now`) actually revert the kernel state
+  instead of just flipping the unit to inactive while leaving cake applied — without it, "stopping" the service is a
+  silent no-op until reboot, which is a footgun.
+- `WantedBy=multi-user.target` makes `systemctl enable` create the symlink that actually runs the unit at boot.
+
+**Step 3 — enable and start it**:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now autocake.service
+```
+
+`--now` runs it immediately so you can see the result without rebooting. To watch the run live, follow the journal:
+
+```bash
+journalctl -u autocake.service -f
+```
+
+**To turn it off**:
+
+```bash
+sudo systemctl disable --now autocake.service       # ExecStop runs autocake-off, reverts kernel state
+sudo rm /etc/systemd/system/autocake.service
+sudo rm /usr/local/bin/autocake-off /usr/local/bin/autocake
+sudo systemctl daemon-reload
+```
+
+The unit fires once per boot and exits. There is intentionally no timer here: re-running `autocake` mid-session would
+contend with the very traffic it's trying to shape, and a periodic cap chosen at 04:00 doesn't transfer to the link's
+prime-time RF environment anyway. If you find the boot-time measurement isn't holding through long sessions on a
+Wi-Fi-extender link, manually re-running is still the right answer — the script is built for that.
 
 ## Requirements
 

@@ -5,19 +5,40 @@
 # adaptive margin of idle, applies cake, and verifies the result. Zero flags,
 # zero env vars, zero per-rig tuning constants.
 #
-# Usage: ./autocake.sh   (auto-elevates with sudo if not already root)
+# Two invocation modes, selected by argv[0] (the symlink name used to run
+# this script — filesystem state, not a flag, not an env var):
+#   autocake        — measure link, apply cake (default)
+#   autocake-off    — remove any cake/ifb state from a previous run, then exit
+#
+# Usage: ./autocake.sh                              (apply, auto-elevates)
+#        ln -s autocake.sh autocake-off; ./autocake-off   (revert)
 #
 # See README.md for the algorithm, requirements, and limitations.
 
 set -uo pipefail
 
-SCRIPT_PATH="$(readlink -f -- "${0}")"
+# Capture the literal invocation path before sudo re-exec. readlink -f
+# would canonicalize symlinks away, and we need the symlink basename
+# (e.g. autocake-off) to survive elevation so argv[0] dispatch works.
+case "${0}" in
+  /*) INVOKED_AS="${0}" ;;
+  *) INVOKED_AS="${PWD}/${0}" ;;
+esac
+
+# Mode is decided by the symlink basename. Anything ending in -off (or
+# -off.sh, for the in-repo `ln -s autocake.sh autocake-off` flow) means
+# tear down; anything else means measure and apply.
+case "${0##*/}" in
+  *-off | *-off.sh) MODE=off ;;
+  *) MODE=on ;;
+esac
+
 if [ "${EUID}" -ne 0 ]; then
   command -v sudo > /dev/null 2>&1 || {
     echo "ERROR: must run as root, and sudo is not available" >&2
     exit 1
   }
-  exec sudo -- "${SCRIPT_PATH}" "${@}"
+  exec sudo -- "${INVOKED_AS}" "${@}"
 fi
 
 for cmd in tc curl ip awk head flock modprobe; do
@@ -27,10 +48,10 @@ for cmd in tc curl ip awk head flock modprobe; do
   }
 done
 
-# Acquire a host-wide lock so two instances can't fight over the ifb device
-# or tc state. The
-# lock lives on FD 9 for the lifetime of the script — when this process
-# exits (any reason) the kernel closes the FD and the lock releases.
+# Acquire a host-wide lock so two instances can't fight over the ifb
+# device or tc state. The lock lives on FD 9 for the lifetime of the
+# script — when this process exits (any reason) the kernel closes the FD
+# and the lock releases.
 #
 # Putting the lock file inside a root-only 0700 directory is the only way
 # to keep a local non-root user from holding an exclusive flock on it: a
@@ -57,35 +78,44 @@ if ! flock -n 9; then
   exit 1
 fi
 
-# Preflight: cake qdisc support. Probes by attaching a no-op cake qdisc to
-# the loopback interface (and removing it immediately). Catches the kernel
-# module (sch_cake, mainlined in 4.19) and the iproute2 'cake' keyword
-# (added in 4.19) in one shot. Failing here surfaces the unsupported-kernel
-# case before any measurement work.
-modprobe sch_cake 2> /dev/null || true
-if ! tc qdisc replace dev lo root cake 2> /dev/null; then
-  echo "ERROR: cake qdisc unsupported on this system." >&2
-  echo "  Need: Linux >= 4.19 with CONFIG_NET_SCH_CAKE, iproute2 >= 4.19." >&2
-  exit 1
-fi
-tc qdisc del dev lo root 2> /dev/null || true
+# On-mode preflights only. Off-mode neither shapes nor probes, so cake
+# kernel support and curl version are irrelevant to teardown — and a user
+# reverting state on a system with stale tooling should still succeed.
+if [ "${MODE}" = on ]; then
+  # Preflight: cake qdisc support. Probes by attaching a no-op cake qdisc to
+  # the loopback interface (and removing it immediately). Catches the kernel
+  # module (sch_cake, mainlined in 4.19) and the iproute2 'cake' keyword
+  # (added in 4.19) in one shot. Failing here surfaces the unsupported-kernel
+  # case before any measurement work.
+  modprobe sch_cake 2> /dev/null || true
+  if ! tc qdisc replace dev lo root cake 2> /dev/null; then
+    echo "ERROR: cake qdisc unsupported on this system." >&2
+    echo "  Need: Linux >= 4.19 with CONFIG_NET_SCH_CAKE, iproute2 >= 4.19." >&2
+    exit 1
+  fi
+  tc qdisc del dev lo root 2> /dev/null || true
 
-# Preflight: curl --next, used by the latency probe to reuse a single TLS
-# connection across samples. Added in curl 7.36 (March 2014). We can't use
-# `curl --help all` to detect support: --help all is itself curl 7.73+, so
-# parsing the version string is the only reliable check.
-CURL_VER="$(curl --version | awk 'NR==1{print $2}')"
-if [ "$(printf '7.36.0\n%s\n' "${CURL_VER}" | sort -V | head -n1)" != "7.36.0" ]; then
-  echo "ERROR: curl ${CURL_VER} is too old; need >= 7.36 for --next." >&2
-  exit 1
+  # Preflight: curl --next, used by the latency probe to reuse a single TLS
+  # connection across samples. Added in curl 7.36 (March 2014). We can't use
+  # `curl --help all` to detect support: --help all is itself curl 7.73+, so
+  # parsing the version string is the only reliable check.
+  CURL_VER="$(curl --version | awk 'NR==1{print $2}')"
+  if [ "$(printf '7.36.0\n%s\n' "${CURL_VER}" | sort -V | head -n1)" != "7.36.0" ]; then
+    echo "ERROR: curl ${CURL_VER} is too old; need >= 7.36 for --next." >&2
+    exit 1
+  fi
 fi
 
 # --- autodetected from system state ---
+# In off-mode an empty IFACE is tolerable: the user may be reverting state
+# on a disconnected machine, and sqm_off's ifb-device deletion still works
+# without one. tc commands against an empty dev fail silently (they're all
+# `2>/dev/null || true` in sqm_off), so no special-casing is needed there.
 IFACE="$(ip -o route show default 2> /dev/null | awk '{print $5; exit}')"
-[ -n "${IFACE}" ] || {
+if [ "${MODE}" = on ] && [ -z "${IFACE}" ]; then
   echo "no default route"
   exit 1
-}
+fi
 
 # --- algorithmic constants (not link-specific tuning) ---
 # Download backends, probed in order. Cloudflare uses a byte-precise URL
@@ -603,6 +633,18 @@ coarse_pass() {
   done
   return 1
 }
+
+# Off-mode dispatch. By here IFACE is detected (or tolerated empty),
+# IFB_DEV is set, sqm_off is defined, and the EXIT/INT trap is armed —
+# everything teardown needs. Mark SQM_COMMITTED=1 afterward so the EXIT
+# trap doesn't re-run sqm_off redundantly: in this mode the kernel state
+# is already exactly what we want it to be (no shaping at all).
+if [ "${MODE}" = off ]; then
+  sqm_off
+  SQM_COMMITTED=1
+  echo "autocake SQM removed"
+  exit 0
+fi
 
 # ---------- Main flow ----------
 
