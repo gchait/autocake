@@ -4,7 +4,7 @@ Fully automated SQM ([cake](https://www.bufferbloat.net/projects/codel/wiki/Cake
 workstation.
 
 Measures your link, picks the bandwidth caps that keep latency under load within an adaptive margin of idle, applies
-cake, and verifies the result. Zero flags, zero env vars, zero per-rig tuning constants — every decision comes from
+`cake`, and verifies the result. Zero flags, zero env vars, zero per-rig tuning constants — every decision comes from
 observed link characteristics.
 
 ## Why
@@ -14,10 +14,10 @@ your path queues up packets under load. Web pages stall, gaming gets choppy, vid
 raw bandwidth is fine. The fix is to install a smart queue (`cake`) at the bottleneck and shape traffic just below the
 link's true capacity.
 
-The hard part isn't the qdisc. It's picking the cap. Too high and the bottleneck stays upstream of cake, so cake doesn't
-help. Too low and you give up bandwidth for nothing. The optimal cap depends on the link, the time of day, and how the
-path is congested — so a one-shot manual setting drifts. This drift is most acute on Wi-Fi (signal strength, channel
-contention, and AP load shift across the day), which is the case `autocake` targets.
+The hard part isn't the qdisc. It's picking the cap. Too high and the bottleneck stays upstream of `cake`, so `cake`
+doesn't help. Too low and you give up bandwidth for nothing. The optimal cap depends on the link, the time of day,
+and how the path is congested — so a one-shot manual setting drifts. This drift is most acute on Wi-Fi (signal
+strength, channel contention, and AP load shift across the day), which is what `autocake` is built for.
 
 `autocake` measures the link end-to-end (HTTP latency to a connectivity-check endpoint, throughput across a parallel
 mirror pool), walks a percentage ladder until it finds a cap that keeps loaded latency within an adaptive threshold,
@@ -49,8 +49,9 @@ ln -s autocake.sh autocake-off   # one-time, in the repo
 
 `cake` state lives in the kernel only and is wiped at every reboot, so by default you re-run `autocake` after each boot.
 If you'd rather have it measure-and-apply automatically at startup, install a tiny systemd unit. Re-measuring every boot
-(rather than persisting the last cap to disk) is deliberate: on a Wi-Fi or extender link the right cap depends on
-*current* RF conditions, not yesterday's, and a fresh ~30 s probe at boot is far cheaper than installing a stale cap.
+(rather than persisting the last cap to disk) is deliberate: on a Wi-Fi link (especially through an extender) the right
+cap depends on *current* RF conditions, not yesterday's, and a fresh ~30 s probe at boot is far cheaper than installing
+a stale cap.
 
 **Step 1 — put the script somewhere stable, with both invocation names**. The service file references absolute paths,
 so the script can't sit in a directory that might be moved or deleted:
@@ -92,7 +93,7 @@ Four points on the syntax, since they're easy to get wrong:
   flipping to `inactive (dead)` and looking like a failure in `systemctl status`. ([Red Hat: oneshot service type](
   https://www.redhat.com/en/blog/systemd-oneshot-service))
 - `ExecStop=/usr/local/bin/autocake-off` makes `systemctl stop` (and `disable --now`) actually revert the kernel state
-  instead of just flipping the unit to inactive while leaving cake applied — without it, "stopping" the service is a
+  instead of just flipping the unit to inactive while leaving `cake` applied — without it, "stopping" the service is a
   silent no-op until reboot, which is a footgun.
 - `WantedBy=multi-user.target` makes `systemctl enable` create the symlink that actually runs the unit at boot.
 
@@ -118,7 +119,7 @@ sudo rm /usr/local/bin/autocake-off /usr/local/bin/autocake
 sudo systemctl daemon-reload
 ```
 
-The unit fires once per boot and exits. There is intentionally no timer here: re-running `autocake` mid-session would
+The unit fires once per boot and exits. There's intentionally no timer here: re-running `autocake` mid-session would
 contend with the very traffic it's trying to shape, and a periodic cap chosen at 04:00 doesn't transfer to the link's
 prime-time RF environment anyway. If you find the boot-time measurement isn't holding through long sessions on a
 Wi-Fi-extender link, manually re-running is still the right answer — the script is built for that.
@@ -128,12 +129,12 @@ Wi-Fi-extender link, manually re-running is still the right answer — the scrip
 | Component    | Version                                        | Reason                                       |
 |--------------|------------------------------------------------|----------------------------------------------|
 | Linux kernel | ≥ 4.19                                         | `sch_cake` mainlined Oct 2018                |
-| iproute2     | ≥ 4.19                                         | `tc` cake support, same release              |
+| iproute2     | ≥ 4.19                                         | `tc` `cake` support, same release            |
 | curl         | ≥ 7.36                                         | `--next` (HTTP connection reuse for latency) |
 | bash         | ≥ 3.1                                          | array-append `+=`                            |
 | Other tools  | `tc`, `ip`, `awk`, `head`, `flock`, `modprobe` | preflighted at startup                       |
 
-`autocake` validates kernel + iproute2 cake support at startup by attaching a no-op cake qdisc to `lo`, and checks
+`autocake` validates kernel + iproute2 `cake` support at startup by attaching a no-op `cake` qdisc to `lo`, and checks
 `curl --version` ≥ 7.36 (the release that introduced `--next`). If either fails it exits with a clear error before doing
 any measurement work.
 
@@ -155,7 +156,7 @@ any measurement work.
    a slow single path can't anchor it below the link's true capacity.
 6. **Shape-or-skip** — runs the loaded probe with no shaping at all. If the unshaped link already passes both gates,
    exits without installing any cap. Catches well-behaved links where any cap below 100% is pure loss.
-7. **Coarse pass** — walks 92% → 80% → 65% → 50% → 35% of measured bandwidth, applying cake at each step under
+7. **Coarse pass** — walks 92% → 80% → 65% → 50% → 35% of measured bandwidth, applying `cake` at each step under
    bidirectional load. First cap that meets both gates wins. Parallel streams ensure the queue actually fills (a single
    stream often falls short of cap on fast links and produces false passes).
 8. **Binary refine** — narrows toward the ceiling between the passing cap and the next-up failure (or 95% if nothing
@@ -178,11 +179,11 @@ These are inherent to the approach, not knobs:
   own uplink. Routers, household-wide shaping, wired-only setups, and DSL/cable links that need link-layer overhead
   modeling are out of scope by design — [sqm-scripts](https://github.com/tohojo/sqm-scripts) is a better fit for those.
 - **External HTTP backends.** Auto-measurement requires reaching public probe endpoints (Google `generate_204`,
-  Cloudflare, OVH/Hetzner/Tele2 mirrors, captive-check endpoints). The pool, round-robin, and liveness checks tolerate
-  individual outages and rate limits, but the approach is structurally dependent on these services staying reachable
-  and behaving consistently — that's the cost of measurement-based tuning that static shapers don't pay. Cloudflare
-  in particular is regionally blocked in some places (notably mainland China); if all backends are blocked, the script
-  can't run.
+  Firefox `detectportal`, Apple captive check, Cloudflare, OVH/Hetzner/Tele2 mirrors). The pool, round-robin, and
+  liveness checks tolerate individual outages and rate limits, but the approach is structurally dependent on these
+  services staying reachable and behaving consistently — that's the cost of measurement-based tuning that static
+  shapers don't pay. Cloudflare in particular is regionally blocked in some places (notably mainland China); if all
+  backends are blocked, the script can't run.
 - **HTTP probe variance is higher than ICMP.** Adaptive sampling and the median-of-bursts baseline mitigate it, but very
   noisy links may still pick a suboptimal cap; re-run to re-measure.
 - **VPN as default route.** If your default route is a VPN tunnel (`tun0`, `wg0`), the tunnel gets shaped instead of the
