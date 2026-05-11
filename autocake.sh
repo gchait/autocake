@@ -169,6 +169,13 @@ LOAD_BYTES_MAX=1000000000 # aggregate ceiling; LOAD_TIMEOUT bounds runtime
 CURL_TIMEOUT=20
 LOAD_TIMEOUT=12
 LATENCY_TIMEOUT=10
+# besteffort, not diffserv3: on a Linux single-host most egress is CS0
+# (kernel doesn't classify, most apps don't mark) so diffserv3's tins
+# would collapse to one in practice. cake's flow fairness already
+# handles intra-host contention (the game's flow vs the torrent's many
+# flows) without tier separation, and on Wi-Fi radio variance dwarfs
+# any few-ms tier gap diffserv would buy. `wash` on ingress is correct
+# regardless — ISP DSCP marks aren't trustworthy for tin selection.
 CAKE_OPTS="besteffort"
 CAKE_INGRESS_OPTS="besteffort wash"
 # Use a project-namespaced ifb device (12 chars; under IFNAMSIZ=15) so we
