@@ -7,9 +7,9 @@ arch=('any')
 url="https://github.com/gchait/autocake"
 license=('MIT')
 depends=('bash' 'iproute2' 'curl')
-# `make` is the only build-time tool we need that isn't in `base`. coreutils
-# (install, ln, sed) and bash are already pulled in by base/base-devel.
-makedepends=('make')
+# No makedepends: base-devel is assumed installed for AUR builds, which
+# already provides make, sed, install, etc. Listing them is discouraged
+# per current Arch packaging guidelines.
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 install=$pkgname.install

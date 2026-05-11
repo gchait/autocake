@@ -1,8 +1,17 @@
+# shellcheck shell=bash
 # pacman .install hook for autocake.
 #
-# We deliberately do NOT `systemctl enable` here — Arch packaging policy
-# leaves service activation to the user. The unit is shipped to
-# /usr/lib/systemd/system/ and is ready to enable when the user wants it.
+# Arch packaging policy is to NOT auto-enable services — the unit is shipped
+# to /usr/lib/systemd/system/ and the user enables it themselves. We don't
+# define post_upgrade/post_remove daemon-reload either: pacman's systemd
+# ALPM hook (/usr/share/libalpm/hooks/30-systemd-daemon-reload-system.hook)
+# handles that automatically when unit files change.
+#
+# We DO define pre_remove to stop the service first. Without it,
+# `pacman -R autocake` removes the binary while leaving any active `cake`
+# qdisc on the kernel — and the unit's ExecStop=autocake-off can no longer
+# run because autocake-off is gone. Stopping in pre_remove (while files
+# still exist) lets ExecStop tear shaping down cleanly.
 
 post_install() {
   cat <<EOF
@@ -13,10 +22,6 @@ post_install() {
 EOF
 }
 
-post_upgrade() {
-  systemctl daemon-reload > /dev/null 2>&1 || true
-}
-
-post_remove() {
-  systemctl daemon-reload > /dev/null 2>&1 || true
+pre_remove() {
+  systemctl --no-reload disable --now autocake.service > /dev/null 2>&1 || true
 }

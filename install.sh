@@ -45,12 +45,15 @@ install)
 
   VERSION="${AUTOCAKE_VERSION:-latest}"
   if [ "${VERSION}" = latest ]; then
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
-      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
-    [ -n "${VERSION}" ] || {
+    # Use the /releases/latest redirect rather than the GitHub API: same
+    # answer, no 60/hr unauthenticated rate limit, no JSON parsing.
+    REDIRECT=$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+      "https://github.com/${REPO}/releases/latest" || true)
+    VERSION="${REDIRECT##*/tag/}"
+    if [ -z "${VERSION}" ] || [ "${VERSION}" = "${REDIRECT}" ]; then
       echo "ERROR: cannot resolve latest release — set AUTOCAKE_VERSION explicitly" >&2
       exit 1
-    }
+    fi
   fi
   PKGVER="${VERSION#v}"
 
