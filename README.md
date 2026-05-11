@@ -10,14 +10,14 @@ observed link characteristics.
 ## Why
 
 [Bufferbloat](https://www.bufferbloat.net/) is the latency spike that happens when an oversized buffer somewhere along
-your path queues up packets under load. Web pages stall, gaming gets choppy, video calls go sideways — even when your
-raw bandwidth is fine. The fix is to install a smart queue (`cake`) at the bottleneck and shape traffic just below the
-link's true capacity.
+your path queues up
+packets under load. Web pages stall, gaming gets choppy, video calls go sideways — even when your raw bandwidth is fine.
+The fix is to install a smart queue (`cake`) at the bottleneck and shape traffic just below the link's true capacity.
 
 The hard part isn't the qdisc. It's picking the cap. Too high and the bottleneck stays upstream of `cake`, so `cake`
 doesn't help. Too low and you give up bandwidth for nothing. The optimal cap depends on the link, the time of day,
-and how the path is congested — so a one-shot manual setting drifts. This drift is most acute on Wi-Fi (signal
-strength, channel contention, and AP load shift across the day), which is what `autocake` is built for.
+and how the path is congested — so a one-shot manual setting drifts. This drift is most acute on Wi-Fi (signal strength,
+channel contention, and AP load shift across the day), which is what `autocake` is built for.
 
 `autocake` measures the link end-to-end (HTTP latency to a connectivity-check endpoint, throughput across a parallel
 mirror pool), walks a percentage ladder until it finds a cap that keeps loaded latency within an adaptive threshold,
@@ -42,8 +42,6 @@ To remove shaping, invoke the script as `autocake-off` — same script, the syml
 ln -s autocake.sh autocake-off   # one-time, in the repo
 ./autocake-off                   # tear down whenever you want
 ```
-
-(Mode is decided by `argv[0]`, not a flag or env var, so the "zero flags / zero env vars" promise stands.)
 
 ## Optional: run on every boot (systemd)
 
@@ -113,7 +111,7 @@ journalctl -u autocake.service -f
 **To turn it off**:
 
 ```bash
-sudo systemctl disable --now autocake.service       # ExecStop runs autocake-off, reverts kernel state
+sudo systemctl disable --now autocake.service
 sudo rm /etc/systemd/system/autocake.service
 sudo rm /usr/local/bin/autocake-off /usr/local/bin/autocake
 sudo systemctl daemon-reload
