@@ -22,6 +22,15 @@ post_install() {
 EOF
 }
 
+post_upgrade() {
+  cat <<EOF
+==> autocake updated. The unit is Type=oneshot so the new version takes
+==> effect on next boot. To re-measure now:
+==>   sudo autocake                              (on demand)
+==>   sudo systemctl restart autocake.service    (if enabled)
+EOF
+}
+
 pre_remove() {
   systemctl --no-reload disable --now autocake.service > /dev/null 2>&1 || true
 }

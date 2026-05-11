@@ -8,6 +8,12 @@ Type=oneshot
 ExecStart=@BINDIR@/autocake
 ExecStop=@BINDIR@/autocake-off
 RemainAfterExit=yes
+# Default TimeoutStartSec is 90s, but a worst-case run (5 coarse rungs +
+# 4 binary-refine iterations + stability recheck, each ~12s under load)
+# can exceed 3 minutes. autocake has its own per-operation curl timeouts
+# so it won't hang indefinitely; this just keeps systemd from killing a
+# legitimate long run on a slow link.
+TimeoutStartSec=600
 
 [Install]
 WantedBy=multi-user.target
