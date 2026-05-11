@@ -68,6 +68,13 @@ install)
   echo "Installing to ${BINDIR} (unit at ${SYSTEMDDIR})..."
   ${SUDO} make install PREFIX="${PREFIX}" SYSTEMDDIR="${SYSTEMDDIR}"
 
+  # Notify systemd that the unit changed. Strictly only required on the
+  # upgrade path (re-installing over an already-loaded unit) — for a
+  # fresh install, systemd loads the unit lazily on first reference. But
+  # standard installer hygiene (matches tailscale/ollama/docker) and
+  # symmetric with the uninstall path below.
+  ${SUDO} systemctl daemon-reload 2> /dev/null || true
+
   cat << EOF
 
 autocake ${VERSION} installed.
