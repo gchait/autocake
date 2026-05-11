@@ -1,0 +1,13 @@
+[Unit]
+Description=autocake — measure link and apply cake SQM
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@BINDIR@/autocake
+ExecStop=@BINDIR@/autocake-off
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

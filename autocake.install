@@ -1,0 +1,22 @@
+# pacman .install hook for autocake.
+#
+# We deliberately do NOT `systemctl enable` here — Arch packaging policy
+# leaves service activation to the user. The unit is shipped to
+# /usr/lib/systemd/system/ and is ready to enable when the user wants it.
+
+post_install() {
+  cat <<EOF
+==> autocake is installed but not enabled.
+==>   Run on demand:        sudo autocake
+==>   Tear down shaping:    sudo autocake-off
+==>   Apply at every boot:  sudo systemctl enable --now autocake.service
+EOF
+}
+
+post_upgrade() {
+  systemctl daemon-reload > /dev/null 2>&1 || true
+}
+
+post_remove() {
+  systemctl daemon-reload > /dev/null 2>&1 || true
+}
