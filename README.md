@@ -156,10 +156,12 @@ any measurement work.
    must stay within Cloudflare AIM's "Great" ceiling (30 ms) — unless the link's idle jitter already exceeds that, in
    which case the gate is dropped (no cap can quiet a noisy radio).
 5. **Throughput** — up to three parallel HTTP streams in each direction, distributed round-robin across a
-   probe-validated pool of mirrors (Cloudflare + OVH + Hetzner + Tele2). Stream count is capped at the live pool size
-   so no single mirror gets two streams (Cloudflare 429s under sustained 2-stream load, which would cascade into
-   stalled probes). Pool size matters: a single mirror that 429s under real load can't zero out the measurement, and
-   a slow single path can't anchor it below the link's true capacity.
+   probe-validated pool of mirrors (Cloudflare + OVH + Hetzner + Linode + Vultr + Scaleway — six independent
+   operators, so no single vendor decision can take more than one out at once). Probes run in parallel, so total
+   startup cost is bounded by one timeout regardless of pool size. Stream count is capped at the live pool size so
+   no single mirror gets two streams (Cloudflare 429s under sustained 2-stream load, which would cascade into stalled
+   probes). Pool size matters: a single mirror that 429s under real load can't zero out the measurement, and a slow
+   single path can't anchor it below the link's true capacity.
 6. **Shape-or-skip** — runs the loaded probe with no shaping at all. If the unshaped link already passes both gates,
    exits without installing any cap. Catches well-behaved links where any cap below 100% is pure loss.
 7. **Coarse pass** — walks 92% → 80% → 65% → 50% → 35% of measured bandwidth, applying `cake` at each step under
@@ -185,11 +187,11 @@ These are inherent to the approach, not knobs:
   own uplink. Routers, household-wide shaping, wired-only setups, and DSL/cable links that need link-layer overhead
   modeling are out of scope by design — [sqm-scripts](https://github.com/tohojo/sqm-scripts) is a better fit for those.
 - **External HTTP backends.** Auto-measurement requires reaching public probe endpoints (Google `generate_204`,
-  Firefox `detectportal`, Apple captive check, Cloudflare, OVH/Hetzner/Tele2 mirrors). The pool, round-robin, and
-  liveness checks tolerate individual outages and rate limits, but the approach is structurally dependent on these
-  services staying reachable and behaving consistently — that's the cost of measurement-based tuning that static
-  shapers don't pay. Cloudflare in particular is regionally blocked in some places (notably mainland China); if all
-  backends are blocked, the script can't run.
+  Firefox `detectportal`, Apple captive check, Cloudflare, plus mirrors at OVH / Hetzner / Linode / Vultr /
+  Scaleway). The pool, round-robin, and liveness checks tolerate individual outages and rate limits, but the
+  approach is structurally dependent on these services staying reachable and behaving consistently — that's the
+  cost of measurement-based tuning that static shapers don't pay. Cloudflare in particular is regionally blocked in
+  some places (notably mainland China); if all backends are blocked, the script can't run.
 - **HTTP probe variance is higher than ICMP.** Adaptive sampling and the median-of-bursts baseline mitigate it, but very
   noisy links may still pick a suboptimal cap; re-run to re-measure.
 - **VPN as default route.** If your default route is a VPN tunnel (`tun0`, `wg0`), the tunnel gets shaped instead of the

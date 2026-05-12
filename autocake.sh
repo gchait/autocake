@@ -130,19 +130,36 @@ if [ "${MODE}" = on ] && [ -z "${IFACE}" ]; then
 fi
 
 # --- algorithmic constants (not link-specific tuning) ---
-# Download backends, probed in order. Cloudflare uses a byte-precise URL
-# template; mirror entries declare a fixed-size file used with HTTP Range.
-# probe_download_backends populates WORKING_DOWNLOAD_BACKENDS with every
-# entry that responds at run start; throughput streams are distributed
-# round-robin across that pool, so a single mirror that 429s under real
-# load (Cloudflare's pattern) cannot zero out the measurement and a slow
-# mirror cannot anchor it below the link's true capacity. Format:
-# "URL [SIZE_BYTES]" — size omitted means byte-precise template.
+# Download backends, probed in parallel at run start. Cloudflare uses a
+# byte-precise URL template; mirror entries declare a fixed-size file
+# used with HTTP Range. probe_download_backends populates
+# WORKING_DOWNLOAD_BACKENDS with every entry that responds; throughput
+# streams are distributed round-robin across that pool, so a single
+# mirror that 429s under real load (Cloudflare's pattern) cannot zero
+# out the measurement and a slow mirror cannot anchor it below the
+# link's true capacity. Format: "URL [SIZE_BYTES]" — size omitted means
+# byte-precise template.
+#
+# The list is ASN-diverse on purpose: each entry sits on a different
+# operator (Cloudflare / OVH / Hetzner / Akamai-Linode / Vultr /
+# Scaleway), so no single vendor decision (cert lapse, service
+# shutdown, regional rate limit) can take more than one out at a time.
+# STREAMS caps active concurrency, so entries beyond the first three
+# act as failover depth — we can lose any three mirrors and still
+# measure with three streams. Every entry serves a ≥ 1 GB test file so
+# even high-Mbit per-stream budgets (gigabit link in degraded mode with
+# only the failover backends alive) don't exhaust the file mid-probe.
+# Past versions hard-coded speed.hetzner.de and speedtest.tele2.net,
+# both silently retired (cert expiry in 2024, service shutdown);
+# picking from independent operators makes that decay rate
+# non-correlated.
 DOWNLOAD_BACKENDS=(
   "https://speed.cloudflare.com/__down?bytes=%BYTES%"
   "https://proof.ovh.net/files/1Gb.dat 1073741824"
-  "https://speed.hetzner.de/1GB.bin 1073741824"
-  "https://speedtest.tele2.net/1GB.zip 1073741824"
+  "https://fsn1-speed.hetzner.com/1GB.bin 1073741824"
+  "https://speedtest.us-east-1.linodeobjects.com/1GB_test.file 1073741824"
+  "https://fra-de-ping.vultr.com/vultr.com.1000MB.bin 1048576000"
+  "https://ipv4.scaleway.testdebit.info/1G.iso 1073741824"
 )
 # Populated by probe_download_backends. Each entry "url|max_bytes" where
 # max_bytes=0 marks a byte-precise template URL, and >0 marks a fixed-size
@@ -221,40 +238,67 @@ select_latency_backend() {
   return 1
 }
 
-# Probe every entry in DOWNLOAD_BACKENDS; populate WORKING_DOWNLOAD_BACKENDS
-# with each that responds 200 (template URL) or 206 (Range-supporting
-# mirror). Returns 0 if at least one backend works. The small probe is
-# necessary but not sufficient — a backend can pass and still 429 under
-# real 3-stream load (Cloudflare's pattern), but stream distribution makes
-# that survivable: the failing backend's stream contributes 0 while
-# siblings still saturate the link.
+# Probe every entry in DOWNLOAD_BACKENDS in parallel; populate
+# WORKING_DOWNLOAD_BACKENDS with each that responds 200 (template URL)
+# or 206 (Range-supporting mirror), preserving DOWNLOAD_BACKENDS order
+# so round-robin stream distribution stays deterministic. Probes overlap
+# so a dead mirror's --max-time wait runs concurrently with live ones —
+# total startup cost is bounded by a single timeout regardless of pool
+# size, which lets us keep a generous failover depth without paying
+# linearly for it. Returns 0 if at least one backend works. The small
+# probe is necessary but not sufficient — a backend can pass and still
+# 429 under real load (Cloudflare's pattern), but stream distribution
+# makes that survivable: the failing backend's stream contributes 0
+# while siblings still saturate the link.
 probe_download_backends() {
   WORKING_DOWNLOAD_BACKENDS=()
-  local entry url size probe_url code
-  for entry in "${DOWNLOAD_BACKENDS[@]}"; do
+  local probe_dir="${WORKDIR}/probe"
+  mkdir -p "${probe_dir}"
+  local i n="${#DOWNLOAD_BACKENDS[@]}"
+  local entry url size
+  local pids=()
+  for ((i = 0; i < n; i++)); do
+    entry="${DOWNLOAD_BACKENDS[i]}"
     url="${entry%% *}"
     size="${entry#* }"
     [ "${size}" = "${entry}" ] && size=0
-    case "${url}" in
-    *%BYTES%*)
-      probe_url="${url//%BYTES%/100000}"
-      code=$(curl -s -o /dev/null --max-time 8 -w '%{http_code}' "${probe_url}" 2> /dev/null || true)
-      code="${code:-000}"
-      echo "  probe: ${url%%/__*}/__down?bytes=100000 → ${code}" >&2
-      if [ "${code}" = "200" ]; then
-        WORKING_DOWNLOAD_BACKENDS+=("${url}|0")
-      fi
-      ;;
-    *)
-      code=$(curl -s -o /dev/null --max-time 8 -r 0-99999 -w '%{http_code}' "${url}" 2> /dev/null || true)
-      code="${code:-000}"
-      echo "  probe: ${url} (Range 0-99999) → ${code}" >&2
-      if [ "${code}" = "206" ] || [ "${code}" = "200" ]; then
-        WORKING_DOWNLOAD_BACKENDS+=("${url}|${size}")
-      fi
-      ;;
-    esac
+    # Subshell scopes probe_url and code per-backend (full fork, no
+    # leakage to the parent); results are written to indexed files and
+    # replayed in order after `wait` so output and the working-pool
+    # array follow DOWNLOAD_BACKENDS order regardless of which probe
+    # finishes first.
+    (
+      case "${url}" in
+      *%BYTES%*)
+        probe_url="${url//%BYTES%/100000}"
+        code=$(curl -s -o /dev/null --max-time 6 -w '%{http_code}' "${probe_url}" 2> /dev/null || true)
+        code="${code:-000}"
+        echo "  probe: ${url%%/__*}/__down?bytes=100000 → ${code}" > "${probe_dir}/${i}.log"
+        if [ "${code}" = "200" ]; then
+          echo "${url}|0" > "${probe_dir}/${i}.ok"
+        fi
+        ;;
+      *)
+        code=$(curl -s -o /dev/null --max-time 6 -r 0-99999 -w '%{http_code}' "${url}" 2> /dev/null || true)
+        code="${code:-000}"
+        echo "  probe: ${url} (Range 0-99999) → ${code}" > "${probe_dir}/${i}.log"
+        if [ "${code}" = "206" ] || [ "${code}" = "200" ]; then
+          echo "${url}|${size}" > "${probe_dir}/${i}.ok"
+        fi
+        ;;
+      esac
+    ) &
+    pids+=($!)
   done
+  # Wait on the captured probe PIDs only — bare `wait` would also block
+  # on any unrelated background jobs the caller has in flight if this
+  # function is ever called outside of startup.
+  wait "${pids[@]}"
+  for ((i = 0; i < n; i++)); do
+    [ -s "${probe_dir}/${i}.log" ] && cat "${probe_dir}/${i}.log" >&2
+    [ -s "${probe_dir}/${i}.ok" ] && WORKING_DOWNLOAD_BACKENDS+=("$(< "${probe_dir}/${i}.ok")")
+  done
+  rm -rf "${probe_dir}"
   [ "${#WORKING_DOWNLOAD_BACKENDS[@]}" -gt 0 ]
 }
 
