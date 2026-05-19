@@ -72,8 +72,8 @@ boot. There's no daemon and nothing to schedule — re-run when your link, ISP p
 
 ## Optional: run on every boot (systemd)
 
-The unit ships with the install but is left disabled per Arch packaging policy (and same default in the universal
-installer for symmetry). If you'd rather have it measure-and-apply automatically at startup, enable it:
+The unit is left disabled per Arch packaging policy (and the same default in the universal installer for symmetry). If
+you'd rather have it measure-and-apply automatically at startup, enable it:
 
 ```bash
 sudo systemctl enable --now autocake.service
