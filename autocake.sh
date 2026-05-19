@@ -385,7 +385,6 @@ sqm_off() {
     tc qdisc del dev "${iface}" root 2> /dev/null || true
   fi
   tc qdisc del dev "${IFB_DEV}" root 2> /dev/null || true
-  ip link set dev "${IFB_DEV}" down 2> /dev/null || true
   ip link del "${IFB_DEV}" 2> /dev/null || true
 }
 
