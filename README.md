@@ -25,13 +25,13 @@ refines it with binary search, and re-verifies stability before committing.
 
 ## Install
 
-**Arch / EndeavourOS** ([AUR](https://aur.archlinux.org/packages/autocake)):
+**Arch-based** ([AUR](https://aur.archlinux.org/packages/autocake)):
 
 ```bash
 yay -S autocake
 ```
 
-**Any Linux** (curl | bash, installs to `/usr/local`):
+**Any Linux** (installs to `/usr/local`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gchait/autocake/main/install.sh | sudo bash
