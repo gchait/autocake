@@ -101,8 +101,18 @@ if [ "${MODE}" = on ]; then
   # case before any measurement work.
   modprobe sch_cake 2> /dev/null || true
   if ! tc qdisc replace dev lo root cake 2> /dev/null; then
-    echo "ERROR: cake qdisc unsupported on this system." >&2
-    echo "  Need: Linux >= 4.19 with CONFIG_NET_SCH_CAKE, iproute2 >= 4.19." >&2
+    # Distinguish "kernel upgraded, not rebooted yet" from genuine
+    # unsupported-kernel. After a package-manager kernel upgrade, the
+    # running kernel's /lib/modules/$(uname -r) directory is deleted,
+    # so no modules can load until reboot — including sch_cake.
+    if [ ! -d "/lib/modules/$(uname -r)" ]; then
+      echo "ERROR: /lib/modules/$(uname -r) is missing — running kernel's modules were removed." >&2
+      echo "  This usually means the kernel package was upgraded but the system hasn't rebooted." >&2
+      echo "  Reboot to load the new kernel, then re-run autocake." >&2
+    else
+      echo "ERROR: cake qdisc unsupported on this system." >&2
+      echo "  Need: Linux >= 4.19 with CONFIG_NET_SCH_CAKE, iproute2 >= 4.19." >&2
+    fi
     exit 1
   fi
   tc qdisc del dev lo root 2> /dev/null || true
