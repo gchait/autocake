@@ -11,10 +11,9 @@ depends=('bash' 'iproute2' 'curl')
 # already provides make, sed, install, etc. Listing them is discouraged
 # per current Arch packaging guidelines.
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-# Replace SKIP with the real hash before publishing to AUR — run
-# `updpkgsums` after tagging the release. SKIP bypasses tarball
-# integrity verification entirely; it's only acceptable while the
-# tag doesn't exist yet (chicken-and-egg during initial setup).
+# Upstream keeps SKIP; publish.sh fills the real hash into the AUR-side
+# copy at submission time so this file never needs to be edited per
+# release. Users install from AUR, never from this PKGBUILD directly.
 sha256sums=('SKIP')
 install=$pkgname.install
 

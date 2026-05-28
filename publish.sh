@@ -85,16 +85,9 @@ SHA=$(sha256sum "${TARBALL_PATH}" | awk '{print $1}')
 echo "tarball OK"
 echo "sha256: ${SHA}"
 
-# --- update PKGBUILD sha256 ---
-step "Update PKGBUILD sha256sums"
-awk -v sha="${SHA}" '
-  /^sha256sums=/ { print "sha256sums=('"'"'" sha "'"'"')"; next }
-  { print }
-' PKGBUILD > PKGBUILD.tmp && mv PKGBUILD.tmp PKGBUILD
-echo "PKGBUILD updated:"
-grep '^sha256sums' PKGBUILD
-
 # --- stage AUR repo ---
+# Upstream PKGBUILD keeps sha256sums=('SKIP') permanently — it's never
+# installed from directly. The real sha lives only in the AUR-side copy.
 step "Stage AUR repo at /tmp/autocake-aur"
 AURDIR="/tmp/autocake-aur"
 rm -rf "${AURDIR}"
@@ -104,6 +97,10 @@ git clone "ssh://aur@aur.archlinux.org/autocake.git" "${AURDIR}" || {
   exit 1
 }
 cp PKGBUILD autocake.install "${AURDIR}/"
+awk -v sha="${SHA}" '
+  /^sha256sums=/ { print "sha256sums=('"'"'" sha "'"'"')"; next }
+  { print }
+' "${AURDIR}/PKGBUILD" > "${AURDIR}/PKGBUILD.tmp" && mv "${AURDIR}/PKGBUILD.tmp" "${AURDIR}/PKGBUILD"
 
 # --- .SRCINFO ---
 step "Generate .SRCINFO"
