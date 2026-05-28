@@ -45,13 +45,14 @@ install)
 
   VERSION="${AUTOCAKE_VERSION:-latest}"
   if [ "${VERSION}" = latest ]; then
-    # Use the /releases/latest redirect rather than the GitHub API: same
-    # answer, no 60/hr unauthenticated rate limit, no JSON parsing.
-    REDIRECT=$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
-      "https://github.com/${REPO}/releases/latest" || true)
-    VERSION="${REDIRECT##*/tag/}"
-    if [ -z "${VERSION}" ] || [ "${VERSION}" = "${REDIRECT}" ]; then
-      echo "ERROR: cannot resolve latest release — set AUTOCAKE_VERSION explicitly" >&2
+    # Resolve latest from tags.atom — first /releases/tag/ link is the
+    # most recent tag. No GitHub Release object required (a bare git
+    # tag suffices), no rate-limited GitHub API, no JSON parsing.
+    VERSION=$(curl -fsSL "https://github.com/${REPO}/tags.atom" |
+      grep -m1 -oE '/releases/tag/[^"]+' |
+      sed 's|/releases/tag/||')
+    if [ -z "${VERSION}" ]; then
+      echo "ERROR: cannot resolve latest tag — set AUTOCAKE_VERSION explicitly" >&2
       exit 1
     fi
   fi
