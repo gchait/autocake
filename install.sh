@@ -45,11 +45,14 @@ install)
 
   VERSION="${AUTOCAKE_VERSION:-latest}"
   if [ "${VERSION}" = latest ]; then
-    # Resolve latest from tags.atom — first /releases/tag/ link is the
-    # most recent tag. No GitHub Release object required (a bare git
-    # tag suffices), no rate-limited GitHub API, no JSON parsing.
+    # Resolve latest from tags.atom — first /releases/tag/v<digit>… link
+    # is the most recent versioned tag. The v-prefix + leading digit
+    # filter skips floating tags like `nightly`/`stable` that some repos
+    # ship and that GitHub orders by tag-update time, not by semver. No
+    # GitHub Release object required (a bare git tag suffices), no
+    # rate-limited GitHub API, no JSON parsing.
     VERSION=$(curl -fsSL "https://github.com/${REPO}/tags.atom" |
-      grep -m1 -oE '/releases/tag/[^"]+' |
+      grep -m1 -oE '/releases/tag/v[0-9][^"]*' |
       sed 's|/releases/tag/||')
     if [ -z "${VERSION}" ]; then
       echo "ERROR: cannot resolve latest tag — set AUTOCAKE_VERSION explicitly" >&2
