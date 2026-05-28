@@ -31,7 +31,7 @@ refines it with binary search, and re-verifies stability before committing.
 yay -S autocake
 ```
 
-**Any Linux** (installs to `/usr/local`):
+**Other systemd distros** (installs to `/usr/local`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/gchait/autocake/main/install.sh | sudo bash
@@ -132,13 +132,19 @@ sudo make uninstall
 
 ## Requirements
 
-| Component    | Version                                        | Reason                                       |
-|--------------|------------------------------------------------|----------------------------------------------|
-| Linux kernel | ≥ 4.19                                         | `sch_cake` mainlined Oct 2018                |
-| iproute2     | ≥ 4.19                                         | `tc` `cake` support, same release            |
-| curl         | ≥ 7.36                                         | `--next` (HTTP connection reuse for latency) |
-| bash         | ≥ 3.1                                          | array-append `+=`                            |
-| Other tools  | `tc`, `ip`, `awk`, `head`, `flock`, `modprobe` | preflighted at startup                       |
+Linux with **systemd, glibc, and GNU coreutils**. The version matrix below is met out of the box by recent Arch,
+Ubuntu 22.04+, and Fedora 38+. Minimal / busybox-only environments (e.g. Alpine without `coreutils` installed) aren't
+supported — the curl-version check relies on `sort -V`, which busybox's `sort` doesn't implement.
+
+| Component    | Version                                                | Reason                                       |
+|--------------|--------------------------------------------------------|----------------------------------------------|
+| Linux kernel | ≥ 4.19                                                 | `sch_cake` mainlined Oct 2018                |
+| iproute2     | ≥ 4.19                                                 | `tc` `cake` support, same release            |
+| curl         | ≥ 7.36                                                 | `--next` (HTTP connection reuse for latency) |
+| bash         | ≥ 3.1                                                  | array-append `+=`                            |
+| Other tools  | `tc`, `ip`, `awk`, `head`, `sort`, `flock`, `modprobe` | preflighted at startup                       |
+
+The universal `install.sh` additionally needs `make`, `tar`, `sed`, and `install` at install time (not at runtime).
 
 `autocake` validates kernel + iproute2 `cake` support at startup by attaching a no-op `cake` qdisc to `lo`, and checks
 `curl --version` ≥ 7.36 (the release that introduced `--next`). If either fails it exits with a clear error before doing

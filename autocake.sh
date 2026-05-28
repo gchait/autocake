@@ -41,7 +41,7 @@ if [ "${EUID}" -ne 0 ]; then
   exec sudo -- "${INVOKED_AS}" "${@}"
 fi
 
-for cmd in tc curl ip awk head flock modprobe; do
+for cmd in tc curl ip awk head flock modprobe sort; do
   command -v "${cmd}" > /dev/null 2>&1 || {
     echo "missing dependency: ${cmd}" >&2
     exit 1
