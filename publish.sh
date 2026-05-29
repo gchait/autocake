@@ -111,6 +111,6 @@ step "Push to AUR (run yourself)"
 cat << EOF
 cd ${AURDIR}
 git add PKGBUILD .SRCINFO autocake.install
-git commit -m "Initial release ${VERSION}"
+git commit -m "Release ${VERSION}"
 git push
 EOF
