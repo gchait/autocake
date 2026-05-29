@@ -1,6 +1,6 @@
 # Maintainer: Guy Chait <53366531+gchait@users.noreply.github.com>
 pkgname=autocake
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Fully automated SQM (cake) bandwidth tuner for Linux Wi-Fi workstations"
 arch=('any')
