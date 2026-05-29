@@ -122,8 +122,24 @@ fi
 # `2>/dev/null || true` in sqm_off), so no special-casing is needed there.
 IFACE="$(ip -o route show default 2> /dev/null | awk '{print $5; exit}')"
 if [ "${MODE}" = on ] && [ -z "${IFACE}" ]; then
-  echo "no default route"
-  exit 1
+  # At boot the Wi-Fi association races the service start. Wait up to 60s
+  # (5s × 12) for a default route to appear before giving up. On an already-
+  # up system the first retry finds the route immediately; on a cold boot it
+  # typically resolves within 10–15s. systemd would mark the unit failed on
+  # exit 1 here, so waiting avoids a spurious failure in the journal.
+  _waited=0
+  until
+    IFACE="$(ip -o route show default 2> /dev/null | awk '{print $5; exit}')"
+    [ -n "${IFACE}" ]
+  do
+    if [ "${_waited}" -ge 60 ]; then
+      echo "no default route after 60s — giving up" >&2
+      exit 1
+    fi
+    echo "waiting for default route... (${_waited}s)" >&2
+    sleep 5
+    _waited=$((_waited + 5))
+  done
 fi
 
 if [ "${MODE}" = on ] && [ ! -d "/sys/class/net/${IFACE}/wireless" ]; then
