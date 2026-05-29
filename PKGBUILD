@@ -20,10 +20,7 @@ install=$pkgname.install
 package() {
   cd "$pkgname-$pkgver"
 
-  # PREFIX=/usr per FHS for distro packages (/usr/local is admin-owned).
-  # SYSTEMDDIR=/usr/lib/systemd/system per systemd's Unit Load Path: that
-  # path is for distro-shipped units, /etc/systemd/system is reserved for
-  # local admin overrides and `systemctl enable` symlinks.
+  # Arch-conventional paths — see README.md § Install for rationale.
   make install \
     DESTDIR="$pkgdir" \
     PREFIX=/usr \

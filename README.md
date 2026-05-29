@@ -154,13 +154,13 @@ any measurement work.
 
 1. **Detect interface** — first device on the default route (`ip route show default`).
 2. **Pick a latency probe backend** — tries Google `generate_204`, Firefox `detectportal`, Apple captive check, then
-   Cloudflare. Connectivity-check endpoints come first because they're built for high-frequency polling and don't trip
-   Cloudflare's small-endpoint rate limits during heavy automated use.
-3. **Idle baseline** — three bursts of HTTP latency samples, picks the median burst's P75 and jitter (P95 − P25).
+   Cloudflare, in order. Connectivity-check endpoints come first because they're built for high-frequency polling and
+   don't trip rate limits during heavy automated use.
+3. **Idle baseline** — multiple bursts of HTTP latency samples, picks the median burst's P75 and jitter (P95 − P25).
    Median, not min, so neither one-off clean reads nor one-off noisy reads anchor the threshold.
-4. **Adaptive thresholds** — loaded latency must stay within `idle_P75 + clamp(2 × jitter, 8, 25) ms`. Loaded jitter
-   must stay within Cloudflare AIM's "Great" ceiling (30 ms) — unless the link's idle jitter already exceeds that, in
-   which case the gate is dropped (no cap can quiet a noisy radio).
+4. **Adaptive thresholds** — loaded latency must stay within `idle_P75 + clamp(mult × jitter, floor, ceiling) ms`.
+   Loaded jitter must stay within Cloudflare AIM's "Great" ceiling — unless the link's idle jitter already exceeds
+   that, in which case the gate is dropped (no cap can quiet a noisy radio).
 5. **Throughput** — up to three parallel HTTP streams in each direction, distributed round-robin across a
    probe-validated pool of mirrors (Cloudflare + OVH + Hetzner + Linode + Vultr + Scaleway — six independent
    operators, so no single vendor decision can take more than one out at once). Probes run in parallel, so total
@@ -170,11 +170,11 @@ any measurement work.
    single path can't anchor it below the link's true capacity.
 6. **Shape-or-skip** — runs the loaded probe with no shaping at all. If the unshaped link already passes both gates,
    exits without installing any cap. Catches well-behaved links where any cap below 100% is pure loss.
-7. **Coarse pass** — walks 92% → 80% → 65% → 50% → 35% of measured bandwidth, applying `cake` at each step under
-   bidirectional load. First cap that meets both gates wins. Parallel streams ensure the queue actually fills (a single
-   stream often falls short of cap on fast links and produces false passes).
-8. **Binary refine** — narrows toward the ceiling between the passing cap and the next-up failure (or 95% if nothing
-   failed). Up to four iterations.
+7. **Coarse pass** — walks a percentage ladder of measured bandwidth, applying `cake` at each step under bidirectional
+   load. First cap that meets both gates wins. Parallel streams ensure the queue actually fills (a single stream often
+   falls short of cap on fast links and produces false passes).
+8. **Binary refine** — narrows toward the ceiling between the passing cap and the next-up failure (or a fixed ceiling
+   if nothing failed).
 9. **Stability re-verification** — re-tests the chosen cap. If the win doesn't reproduce, steps down one rung and
    re-checks rather than installing a transient pass.
 10. **Best-effort fallback** — if no cap meets the strict gates but the lowest-latency cap tested still cuts loaded P75
@@ -192,19 +192,17 @@ These are inherent to the approach, not knobs:
 - **Wi-Fi single-host only.** Designed for a Linux laptop or desktop on Wi-Fi (often through an extender) shaping its
   own uplink. Routers, household-wide shaping, wired-only setups, and DSL/cable links that need link-layer overhead
   modeling are out of scope by design — [sqm-scripts](https://github.com/tohojo/sqm-scripts) is a better fit for those.
-- **External HTTP backends.** Auto-measurement requires reaching public probe endpoints (Google `generate_204`,
-  Firefox `detectportal`, Apple captive check, Cloudflare, plus mirrors at OVH / Hetzner / Linode / Vultr /
-  Scaleway). The pool, round-robin, and liveness checks tolerate individual outages and rate limits, but the
-  approach is structurally dependent on these services staying reachable and behaving consistently — that's the
-  cost of measurement-based tuning that static shapers don't pay. Cloudflare in particular is regionally blocked in
-  some places (notably mainland China); if all backends are blocked, the script can't run.
+- **External HTTP backends.** Auto-measurement requires reaching the probe endpoints listed in steps 2 and 5 above.
+  The pool, round-robin, and liveness checks tolerate individual outages and rate limits, but the approach is
+  structurally dependent on these services staying reachable and behaving consistently — that's the cost of
+  measurement-based tuning that static shapers don't pay. Cloudflare in particular is regionally blocked in some
+  places (notably mainland China); if all backends are blocked, the script can't run.
 - **HTTP probe variance is higher than ICMP.** Adaptive sampling and the median-of-bursts baseline mitigate it, but very
   noisy links may still pick a suboptimal cap; re-run to re-measure.
-- **VPN as default route.** If your default route is a VPN tunnel (`tun0`, `wg0`), the tunnel gets shaped instead of the
-  physical uplink. Check the `Interface:` line in the output before trusting the result.
+- **VPN as default route.** If your default route is a VPN tunnel (`tun0`, `wg0`), autocake exits without shaping —
+  tunnel interfaces aren't Wi-Fi. Shape the physical uplink directly, or use sqm-scripts.
 - **Very fast links (≳ 1 Gbit).** Reachable on Wi-Fi 6/6E/7 with wide channels and a clean radio environment.
-  Per-stream bytes can finish before the latency probe completes; the liveness check rejects samples taken after the
-  load ended, but the script falls back to lower caps in this range rather than reporting false passes.
+  The script handles early stream completion without false passes, but falls back to lower caps in this range.
 - **Wireless link variance dominates the cap.** On Wi-Fi, especially through extenders, the measured "best cap" can
   swing 2× between runs because the radio environment isn't stationary. `autocake` chooses the right cap *for the link
   as it was during measurement*, not a permanent fixed point. Re-run when conditions change.

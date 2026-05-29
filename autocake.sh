@@ -1,16 +1,9 @@
 #!/bin/bash
-# autocake — fully automated SQM (cake) bandwidth tuner.
+# Two invocation modes, selected by argv[0] (symlink basename — not a flag):
+#   autocake        — measure link, apply cake
+#   autocake-off    — remove any cake/ifb state from a previous run
 #
-# Measures your link, picks the cap that keeps latency under load within an
-# adaptive margin of idle, applies cake, and verifies the result. Zero flags,
-# zero env vars, zero per-rig tuning constants.
-#
-# Two invocation modes, selected by argv[0] (the symlink name used to run
-# this script — filesystem state, not a flag, not an env var):
-#   autocake        — measure link, apply cake (default)
-#   autocake-off    — remove any cake/ifb state from a previous run, then exit
-#
-# Usage: ./autocake.sh                              (apply, auto-elevates)
+# Usage: ./autocake.sh                                    (apply, auto-elevates)
 #        ln -s autocake.sh autocake-off; ./autocake-off   (revert)
 #
 # See README.md for the algorithm, requirements, and limitations.
@@ -78,12 +71,6 @@ if ! flock -n 9; then
   exit 1
 fi
 
-# State file: written at the end of a successful on-mode run so off-mode
-# (and the next on-mode run, in case the default route has changed) can
-# clean up the iface that was actually shaped, not whichever iface
-# happens to be the default route at teardown time. Lives in /run so it
-# inherits the same root-only 0700 dir the lock uses, and so it's wiped
-# at reboot — exactly matching cake's own kernel-only persistence.
 STATE_FILE="${LOCK_DIR}/state"
 SAVED_IFACE=""
 if [ -r "${STATE_FILE}" ]; then
@@ -139,30 +126,15 @@ if [ "${MODE}" = on ] && [ -z "${IFACE}" ]; then
   exit 1
 fi
 
+if [ "${MODE}" = on ] && [ ! -d "/sys/class/net/${IFACE}/wireless" ]; then
+  echo "default route is on ${IFACE} (not Wi-Fi) — autocake is for Wi-Fi links only" >&2
+  exit 0
+fi
+
 # --- algorithmic constants (not link-specific tuning) ---
-# Download backends, probed in parallel at run start. Cloudflare uses a
-# byte-precise URL template; mirror entries declare a fixed-size file
-# used with HTTP Range. probe_download_backends populates
-# WORKING_DOWNLOAD_BACKENDS with every entry that responds; throughput
-# streams are distributed round-robin across that pool, so a single
-# mirror that 429s under real load (Cloudflare's pattern) cannot zero
-# out the measurement and a slow mirror cannot anchor it below the
-# link's true capacity. Format: "URL [SIZE_BYTES]" — size omitted means
-# byte-precise template.
-#
-# The list is ASN-diverse on purpose: each entry sits on a different
-# operator (Cloudflare / OVH / Hetzner / Akamai-Linode / Vultr /
-# Scaleway), so no single vendor decision (cert lapse, service
-# shutdown, regional rate limit) can take more than one out at a time.
-# STREAMS caps active concurrency, so entries beyond the first three
-# act as failover depth — we can lose any three mirrors and still
-# measure with three streams. Every entry serves a ≥ 1 GB test file so
-# even high-Mbit per-stream budgets (gigabit link in degraded mode with
-# only the failover backends alive) don't exhaust the file mid-probe.
-# Past versions hard-coded speed.hetzner.de and speedtest.tele2.net,
-# both silently retired (cert expiry in 2024, service shutdown);
-# picking from independent operators makes that decay rate
-# non-correlated.
+# Download backends. Format: "URL [SIZE_BYTES]" — size omitted means
+# byte-precise template; size present means HTTP Range mirror.
+# One entry per ASN; see README.md § "How it works" for pool design rationale.
 DOWNLOAD_BACKENDS=(
   "https://speed.cloudflare.com/__down?bytes=%BYTES%"
   "https://proof.ovh.net/files/1Gb.dat 1073741824"
@@ -176,10 +148,8 @@ DOWNLOAD_BACKENDS=(
 # mirror to be loaded with HTTP Range up to that ceiling.
 WORKING_DOWNLOAD_BACKENDS=()
 SPEEDTEST_UP_URL="https://speed.cloudflare.com/__up"
-# Latency probe backends, tried in order. Connectivity-check endpoints
-# (designed for frequent polling) come first so we don't trip Cloudflare's
-# small-endpoint rate limit during heavy runs. Cloudflare stays as fallback
-# in case the primaries are blocked in a region.
+# Latency probe backends, tried in order. Connectivity-check endpoints come
+# first (high-frequency polling safe); Cloudflare last (regional blocks).
 LATENCY_BACKENDS=(
   "https://www.google.com/generate_204"
   "http://detectportal.firefox.com/success.txt"
@@ -196,20 +166,12 @@ LOAD_BYTES_MAX=1000000000 # aggregate ceiling; LOAD_TIMEOUT bounds runtime
 CURL_TIMEOUT=20
 LOAD_TIMEOUT=12
 LATENCY_TIMEOUT=10
-# besteffort, not diffserv3: on a Linux single-host most egress is CS0
-# (kernel doesn't classify, most apps don't mark) so diffserv3's tins
-# would collapse to one in practice. cake's flow fairness already
-# handles intra-host contention (the game's flow vs the torrent's many
-# flows) without tier separation, and on Wi-Fi radio variance dwarfs
-# any few-ms tier gap diffserv would buy. `wash` on ingress is correct
-# regardless — ISP DSCP marks aren't trustworthy for tin selection.
+# besteffort intentional — see CLAUDE.md. wash on ingress: ISP DSCP marks
+# aren't trustworthy for tin selection regardless of egress mode.
 CAKE_OPTS="besteffort"
 CAKE_INGRESS_OPTS="besteffort wash"
-# Use a project-namespaced ifb device (12 chars; under IFNAMSIZ=15) so we
-# never collide with an ifb0 that another shaper / VPN / monitor on the
-# same host already owns. Without this, sqm_off's `ip link del` would
-# happily destroy a foreign ifb0 — and `ip link add` returning EEXIST
-# would silently make us reuse it.
+# Project-namespaced ifb (12 chars; under IFNAMSIZ=15): `ip link del` won't
+# destroy a foreign ifb0, and `ip link add` EEXIST won't silently reuse one.
 IFB_DEV="ifb-autocake"
 MIN_MBIT=5
 STREAMING_GREAT_FLOOR=100   # Cloudflare's Streaming-Great download spec (Mbit)
@@ -249,17 +211,9 @@ select_latency_backend() {
 }
 
 # Probe every entry in DOWNLOAD_BACKENDS in parallel; populate
-# WORKING_DOWNLOAD_BACKENDS with each that responds 200 (template URL)
-# or 206 (Range-supporting mirror), preserving DOWNLOAD_BACKENDS order
-# so round-robin stream distribution stays deterministic. Probes overlap
-# so a dead mirror's --max-time wait runs concurrently with live ones —
-# total startup cost is bounded by a single timeout regardless of pool
-# size, which lets us keep a generous failover depth without paying
-# linearly for it. Returns 0 if at least one backend works. The small
-# probe is necessary but not sufficient — a backend can pass and still
-# 429 under real load (Cloudflare's pattern), but stream distribution
-# makes that survivable: the failing backend's stream contributes 0
-# while siblings still saturate the link.
+# WORKING_DOWNLOAD_BACKENDS preserving order (so round-robin is deterministic).
+# Probes overlap so total startup cost is one timeout regardless of pool size.
+# Returns 0 if at least one backend works.
 probe_download_backends() {
   WORKING_DOWNLOAD_BACKENDS=()
   local probe_dir="${WORKDIR}/probe"
@@ -344,20 +298,10 @@ download_bg() {
 }
 
 # Background-fire one upload stream against SPEEDTEST_UP_URL. Symmetric to
-# download_bg. The body is fed via process substitution rather than a pipe
-# subshell so curl is the direct background child — $! is curl's PID, and
-# on_interrupt's kill reaches it directly (no orphan grandchildren).
-#
-# Upload is single-mirror by design: there isn't a public pool of
-# unauthenticated POST endpoints to round-robin across (most require
-# auth, session tokens, or CORS-protected origins). Concurrent upload
-# load is bounded by STREAMS, which is itself capped at the download
-# pool size — so when downloads are forced to 1-2 streams (the common
-# case with mirror flakiness), uploads inherit the same cap. With a
-# richer download pool (STREAMS=3+), uploads concentrate on Cloudflare;
-# if a stream 429s, measure_parallel filters its contribution (HTTP
-# code != 200/206 → 0 bps), so the failure mode is a slightly under-
-# counted UL measurement, not a hard failure or stalled probe.
+# download_bg. Process substitution (not a pipe subshell) keeps curl as the
+# direct background child so $! is curl's PID and on_interrupt reaches it.
+# Upload is single-mirror: no public pool of unauthenticated POST endpoints
+# exists to round-robin across.
 upload_bg() {
   local out="$1" bytes="$2" timeout="$3" wfmt="$4"
   local args=(-s -o /dev/null --max-time "${timeout}" -X POST --data-binary @-)
@@ -371,13 +315,9 @@ wait_all() {
   for pid in "$@"; do wait "${pid}" 2> /dev/null || true; done
 }
 
-# sqm_off [iface] — tear down cake on the named iface (default: $IFACE)
-# and remove the project-namespaced ifb device. Accepting an iface
-# argument lets the off-mode dispatch and the on-mode initial cleanup
-# handle the case where the default route has shifted between apply and
-# revert (laptop docked, VPN swing): we read the iface that was actually
-# shaped from the persisted state file and clean *that* one, not the
-# current default route.
+# sqm_off [iface] — tear down cake on iface (default: $IFACE) and remove the
+# project-namespaced ifb device. Iface arg lets cleanup target the previously
+# shaped device when the default route has shifted since apply time.
 sqm_off() {
   local iface="${1:-${IFACE:-}}"
   if [ -n "${iface}" ]; then
@@ -434,12 +374,9 @@ WORKDIR=$(mktemp -d) || {
   echo "ERROR: mktemp -d failed" >&2
   exit 1
 }
-# SQM_COMMITTED flips to 1 after the final sqm_apply at the end of a
-# successful run. The EXIT trap reads it: any exit before that point
-# (preflight failure, set -u violation, SIGHUP, SIGTERM during search,
-# etc.) tears SQM down rather than leaving the link in an intermediate
-# shaped state. on_interrupt still calls sqm_off explicitly so the
-# message ordering on Ctrl+C is sensible; the EXIT path is idempotent.
+# SQM_COMMITTED=0 keeps the EXIT trap in rollback mode until the final apply
+# succeeds. on_interrupt calls sqm_off explicitly for message ordering; EXIT
+# path is idempotent.
 SQM_COMMITTED=0
 on_interrupt() {
   echo
@@ -494,11 +431,7 @@ http_latency_stats() {
       '
 }
 
-# Robust idle baseline: take IDLE_BURSTS bursts of IDLE_BURST_SAMPLES, echo
-# the median burst's "P75 JITTER". Median (not min) so neither a single
-# clean burst over-tightens the threshold nor a single noisy burst loosens
-# it; the baseline reflects typical link conditions, which is what loaded
-# probes need to be measured against to install a stable cap.
+# IDLE_BURSTS bursts of IDLE_BURST_SAMPLES; echoes the median burst's "P75 JITTER".
 idle_baseline() {
   local i p75 jit pairs=""
   for ((i = 1; i <= IDLE_BURSTS; i++)); do
@@ -577,18 +510,12 @@ load_bytes_per_stream() {
 }
 
 # Generate bidirectional load with STREAMS parallel streams per direction,
-# return "P75_ms JITTER_ms" under load. Multi-stream load is needed because
-# a single HTTP stream often falls short of cap on fast links — the queue
-# never fills and the probe falsely reports clean latency.
+# return "P75_ms JITTER_ms" under load.
 #
-# Liveness check before sampling: on very fast caps, per-stream bytes can
-# finish before the probe completes; on backend-rate-limited caps, one
-# stream can 429 out while siblings keep going. Either case partially
-# drains the queue and would let the latency probe read something
-# between idle and loaded — a false pass. Require alive ≥ STREAMS - 1
-# (i.e. tolerate at most one dropout) so a single transient backend
-# hiccup doesn't make every cap unmeasurable, while still rejecting the
-# 1-of-3 partial-drain case the original "any alive" check missed.
+# Liveness check before sampling: streams can finish early (fast cap) or 429
+# out (rate-limited backend), either draining the queue for a false-pass read.
+# Require alive ≥ STREAMS-1: tolerates one dropout without making every cap
+# unmeasurable, but still rejects the 1-of-3 partial-drain case.
 loaded_latency_bidir() {
   local down_cap="${1}" up_cap="${2}"
   local down_bytes up_bytes
@@ -758,14 +685,7 @@ coarse_pass() {
   return 1
 }
 
-# Off-mode dispatch. By here IFACE is detected (or tolerated empty),
-# IFB_DEV is set, sqm_off is defined, and the EXIT/INT trap is armed —
-# everything teardown needs. Prefer the saved iface (the one the previous
-# on-mode run actually shaped) over the current default route, so we
-# clean up the right device when the route has shifted since apply time.
-# Mark SQM_COMMITTED=1 afterward so the EXIT trap doesn't re-run sqm_off
-# redundantly: in this mode the kernel state is already exactly what we
-# want (no shaping at all).
+# SQM_COMMITTED=1 after teardown so the EXIT trap doesn't re-run sqm_off.
 if [ "${MODE}" = off ]; then
   target_iface="${SAVED_IFACE:-${IFACE}}"
   sqm_off "${target_iface}"
@@ -816,18 +736,11 @@ else
   LOADED_SAMPLES=$(((LOADED_SAMPLES_LOW + LOADED_SAMPLES_HIGH) / 2))
 fi
 
-# Adaptive threshold: mult × jitter, clamped.
-# Floor: cake can deliver ~5-8 ms loaded delta on a clean link.
-# Ceiling: anything beyond ~25 ms is bufferbloat regardless of jitter.
 THRESHOLD_EXTRA_MS=$((IDLE_JITTER * JITTER_THRESHOLD_MULT))
 [ "${THRESHOLD_EXTRA_MS}" -lt "${THRESHOLD_EXTRA_MIN_MS}" ] && THRESHOLD_EXTRA_MS="${THRESHOLD_EXTRA_MIN_MS}"
 [ "${THRESHOLD_EXTRA_MS}" -gt "${THRESHOLD_EXTRA_MAX_MS}" ] && THRESHOLD_EXTRA_MS="${THRESHOLD_EXTRA_MAX_MS}"
 THRESHOLD_MS=$((IDLE + THRESHOLD_EXTRA_MS))
 
-# Loaded-jitter gate. If the link's idle jitter is already above Cloudflare's
-# Great ceiling, no shaping can deliver Great anyway — disable the gate and
-# leave selection to the latency threshold. Otherwise demand loaded jitter
-# stay within the Great ceiling.
 if [ "${IDLE_JITTER}" -ge "${GREAT_JITTER_MS}" ]; then
   JITTER_THRESHOLD_MS="${JITTER_GATE_OFF}"
   JITTER_THRESHOLD_DISPLAY="off; idle jitter ${IDLE_JITTER}ms ≥ ${GREAT_JITTER_MS}ms"
@@ -918,12 +831,6 @@ if [ "${BEST_PCT}" -eq 0 ] && [ "${ENFORCE_STREAMING_FLOOR}" -eq 1 ]; then
   coarse_pass || true
 fi
 
-# Best-effort fallback: no cap met strict thresholds, but if some tested
-# cap reduced loaded P75 by more than a third vs unshaped, applying it is
-# strictly better than leaving the link wide open at unshaped bufferbloat.
-# RF-limited / WiFi-extender links typically land here — they can't reach
-# Cloudflare's "Great" tier no matter what, but the user still benefits
-# from a controlled queue.
 BEST_EFFORT=0
 if [ "${BEST_PCT}" -eq 0 ] && [ "${BEST_NEARMISS_LAT}" -lt 999999 ] && [ "${UNSHAPED_LAT}" -gt 0 ]; then
   IMPROVEMENT=$((UNSHAPED_LAT - BEST_NEARMISS_LAT))
@@ -972,9 +879,6 @@ if [ "${FAIL_PCT}" -gt "${BEST_PCT}" ]; then
   done
 fi
 
-# Stability re-verification: re-test the chosen cap. If the win doesn't
-# reproduce, step down one rung and re-check rather than installing a
-# transient pass that won't hold during real use.
 echo "Re-verifying stability at ${BEST_PCT}%..."
 sqm_apply "${BEST_UP}" "${BEST_DOWN}"
 read -r RECHECK_LAT RECHECK_JIT < <(loaded_latency_bidir "${BEST_DOWN}" "${BEST_UP}")
@@ -1038,13 +942,8 @@ else
   fi
 fi
 
-# Confidence assessment: a one-line label backed by simple signals so the
-# user knows whether to trust the picked cap or re-run for a cleaner read.
-# No additional probing — purely a synthesis of evidence already collected.
-#   + idle jitter (noisy idle = lower confidence)
-#   + backend pool size (more diverse = better link-capacity reading)
-#   + recheck delta vs search probe (large drift = high variance)
-#   + which path picked the cap (clean PASS / step-down / best-effort)
+# Confidence label: pure synthesis of already-collected signals, no extra probing.
+#   + idle jitter      + pool size      + recheck delta      + which path won
 CONF_SCORE=0
 CONF_NOTES=()
 if [ "${IDLE_JITTER}" -le "${JITTER_LOW_MS}" ]; then
@@ -1096,11 +995,7 @@ fi
 # Refinement / fallback may have left a different cap active; re-apply best.
 sqm_apply "${BEST_UP}" "${BEST_DOWN}"
 SQM_COMMITTED=1
-# Persist iface (and a few diagnostic fields) so off-mode can clean up
-# the right device even if the default route shifts before teardown.
-# Stored in /run, so the file vanishes at reboot — same lifetime as the
-# kernel cake state itself. Best-effort: a write failure here doesn't
-# undo the successful apply we just made.
+# Best-effort: a write failure here doesn't undo the successful apply.
 {
   printf 'iface=%s\n' "${IFACE}"
   printf 'ifb=%s\n' "${IFB_DEV}"

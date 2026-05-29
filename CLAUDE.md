@@ -1,9 +1,3 @@
-# autocake
-
-Single Bash script that measures a Linux Wi-Fi workstation's link, picks the cake bandwidth cap that keeps loaded
-latency within an adaptive margin of idle, and applies it. Zero flags, zero env vars, zero per-rig tuning constants.
-Scope is single-host self-shaping — not routers, not wired uplinks.
-
 ## Architecture you won't get from grep
 
 - **Mode dispatch is by `argv[0]`**, not flags: `autocake` applies, `autocake-off` tears down. The `Makefile` installs
@@ -47,6 +41,3 @@ make install                  # PREFIX=/usr/local SYSTEMDDIR=/etc/systemd/system
 sudo autocake                 # measure + apply
 sudo autocake-off             # revert
 ```
-
-PKGBUILD (AUR) and `install.sh` (curl|bash) both delegate to the same `Makefile` — the Makefile is the single source of
-truth for install logic.

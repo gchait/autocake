@@ -1,11 +1,8 @@
 #!/usr/bin/env bash
 # Universal installer for autocake.
 #
-# Downloads the latest release tarball and runs `make install` from it,
-# so the install logic stays in the Makefile (one source of truth shared
-# with the AUR PKGBUILD). Installs to /usr/local by default; the systemd
-# unit lands in /etc/systemd/system, the right path for admin-installed
-# units (distro packages use /usr/lib/systemd/system instead).
+# Downloads the latest release tarball and delegates to `make install`.
+# See Makefile for install path logic and README.md for path conventions.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/gchait/autocake/main/install.sh | sudo bash
